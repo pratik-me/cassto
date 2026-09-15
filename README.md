@@ -1,132 +1,170 @@
-## NOTE: WorkflowSim IS NO LONGER MAINTAINED.
+# CASSTO: QoS-Oriented Scientific Workflow Scheduling in Cloud Computing
+
+An extension of the **WorkflowSim 1.0** toolkit implementing and benchmarking **CASSTO** (*Cloud-Aware Seal Search Task Optimization*) and comparative metaheuristic scheduling algorithms for scientific workflows in cloud computing environments.
 
 ---
 
-Table of Contents
------------------
+## 📌 Overview & Academic Background
 
-1. Directory structure of the WorkflowSim Toolkit
-2. Software requirements: Java version 1.6 or newer 
-3. Installation and running the WorkflowSim Toolkit
+This repository provides the reference Java implementation and evaluation testbeds for the academic paper:
 
+> **"CASSTO: a bio‑inspired metaheuristic for QoS‑oriented scientific workflow scheduling in cloud computing"**  
+> *Hameed R. et al., Journal of Supercomputing (2026).*
 
-1. Directory structure of the WorkflowSim Toolkit
-----------------------------------------------
+Scientific workflow scheduling in cloud environments is an NP-hard optimization problem involving conflicting Quality of Service (QoS) criteria such as makespan, monetary execution cost, and resource utilization under strict DAG task precedence constraints. 
 
-workflowsim/			-- top level WorkflowSim directory
-	docs/			-- WorkflowSim API Documentation
-	examples/		-- WorkflowSim examples
-	lib/			-- WorkflowSim jar archives
-	sources/		-- WorkflowSim source code
+This project extends **WorkflowSim 1.0** with novel bio-inspired and evolutionary metaheuristics, allowing researchers and practitioners to seamlessly compare the performance of **CASSTO** against other metaheuristics (**HICA**, **GA**) and standard workflow heuristics (**HEFT**, **DHEFT**, **Random**).
 
+---
 
-2. Software requirements: Java version 1.6 or newer
----------------------------------------------------
+## 🚀 Implemented Algorithms
 
-WorkflowSim has been tested and ran on Sun's Java version 1.8.0 or newer.
-If you have non-Sun Java version, such as gcj or J++, they may not be compatible.
-You can use Eclipse, NetBeans, or Ant to compile and run WorkflowSim
+| Algorithm | Type | Implementation Class | Description |
+| :--- | :--- | :--- | :--- |
+| **CASSTO** | Bio-inspired Metaheuristic | [`CASSTOPlanningAlgorithm.java`](sources/org/workflowsim/planning/CASSTOPlanningAlgorithm.java) | **Cloud-Aware Seal Search Task Optimization**: Uses Brownian search for local exploitation and Lévy flight jumps for global exploration, guided by population diversity metrics and task urgency (critical path). |
+| **HICA** | Evolutionary Metaheuristic | [`HICAPlanningAlgorithm.java`](sources/org/workflowsim/planning/HICAPlanningAlgorithm.java) | **Hybrid Imperialist Competitive Algorithm**: Socio-politically inspired metaheuristic with imperialist assimilation, colony revolution, and inter-empire competition. |
+| **GA** | Evolutionary Metaheuristic | [`GAPlanningAlgorithm.java`](sources/org/workflowsim/planning/GAPlanningAlgorithm.java) | **Genetic Algorithm**: Standard baseline featuring tournament selection ($k=3$), uniform crossover ($p_c=0.8$), mutation ($p_m=0.05$), and elitism. |
+| **HEFT** | List-Scheduling Heuristic | [`HEFTPlanningAlgorithm.java`](sources/org/workflowsim/planning/HEFTPlanningAlgorithm.java) | **Heterogeneous Earliest Finish Time**: Deterministic DAG scheduling baseline prioritizing tasks via upward rank values ($rank_u$). |
+| **DHEFT** | Dynamic Heuristic | [`DHEFTPlanningAlgorithm.java`](sources/org/workflowsim/planning/DHEFTPlanningAlgorithm.java) | **Dynamic HEFT**: Adaptive variation of HEFT for heterogeneous environments. |
+| **Random** | Baseline | [`RandomPlanningAlgorithm.java`](sources/org/workflowsim/planning/RandomPlanningAlgorithm.java) | Uniformly distributes tasks randomly across available VMs. |
 
-3. Installation and running the WorkflowSim Toolkit
-### Welcome to WorkflowSim Pages.
-WorkflowSim is a workflow simulator to support large-scale scheduling, clustering and provisioning studies. It is developed by Weiwei Chen, a Phd student from University of Southern California under the Apache License version 2.0. WorkflowSim is not yet fully completed and we welcome your contribution to this project. 
+---
 
-This page introduces the basic features of WorkflowSim and how to install and run it with Eclipse or NetBeans.
+## 🎯 QoS Objectives & Multi-Objective Fitness Model
 
-### 1. Use WorkflowSim with GitHub/Eclipse
+To ensure fair and rigorous benchmarking across CASSTO, HICA, and GA, all metaheuristics share an identical DAG traversal pipeline and weighted-sum fitness formulation:
 
-( It is suggested to use WorkflowSim if you are going to contribute back to this project, otherwise it is not required. )
+$$\text{Fitness} = w_1 \cdot \text{Makespan}_{\text{norm}} + w_2 \cdot \text{Cost}_{\text{norm}} + w_3 \cdot (1 - \text{ResourceUtilization})$$
 
+- **Makespan**: Maximum completion time across all workflow tasks.
+- **Cost**: VM computation cost based on execution duration and VM processing capacity (MIPS-rate pricing model).
+- **Resource Utilization**: Ratio of busy VM execution time to total VM active leasing time.
+- **Precedence Integrity**: Topological ordering guarantees 100% valid task execution without precedence violations.
 
-1.1 Register a GitHub account and fork your own branch
+---
 
-Go to the repository page (https://github.com/WorkflowSim/WorkflowSim-1.0) and click 'Fork' on the top-right corner next to 'Star'. Then you will have your own branch of WorkflowSim and you can maintain your codes under this branch and commit your changes to it. In this example, we use 'chenww05' as an example and you will see a new repo called chenww05/WorkflowSim-1.0. Go to your repo, and copy the path. In this case, it is "https://github.com/chenww05/WorkflowSim-1.0.git". 
+## 📂 Project Structure
 
-1.2 Install EGit
+```plaintext
+WorkflowSim-1/
+├── config/
+│   └── dax/                         # Real-world scientific workflow DAG datasets (XML format)
+│       ├── Montage_{25..1000}.xml   # Astronomy workflow
+│       ├── CyberShake_{30..1000}.xml# Earthquake science workflow
+│       ├── Epigenomics_{24..997}.xml# Genome sequencing workflow
+│       ├── Inspiral_{30..1000}.xml  # Gravitational physics (LIGO) workflow
+│       └── Sipht_{30..1000}.xml     # Bioinformatics workflow
+├── sources/
+│   └── org/workflowsim/
+│       ├── planning/                # Core planning algorithms
+│       │   ├── CASSTOPlanningAlgorithm.java
+│       │   ├── HICAPlanningAlgorithm.java
+│       │   ├── GAPlanningAlgorithm.java
+│       │   ├── HEFTPlanningAlgorithm.java
+│       │   ├── DHEFTPlanningAlgorithm.java
+│       │   └── RandomPlanningAlgorithm.java
+│       ├── scheduling/              # Scheduling & VM mapping handlers
+│       ├── WorkflowPlanner.java     # Planner orchestrator
+│       └── WorkflowEngine.java      # Workflow execution engine
+├── examples/
+│   └── org/workflowsim/examples/
+│       ├── CASSTO_1.java            # CASSTO execution example & benchmark runner
+│       ├── HICA.java                # HICA execution example
+│       ├── GA_1.java                # GA execution example
+│       └── planning/                # HEFT & DHEFT example runners
+├── lib/                             # Required runtime JAR libraries
+│   ├── commons-math3-3.2.jar
+│   ├── flanagan.jar
+│   └── jdom-2.0.0.jar
+└── README.md
+```
 
+---
 
-Open your Eclipse, go to 'Help'->'Install New Software', in 'Work with', choose '--All Available Sites', make sure you have EGit listed, otherwise click the item and install it. 
+## 🛠️ Prerequisites & Setup
 
-1.3 Check out your source codes
+- **Java Development Kit (JDK)**: Java 8 or newer (JDK 8 / 11 / 17 / 21+).
+- **IDE (Recommended)**: Eclipse, IntelliJ IDEA, VS Code, or NetBeans.
 
-First, create a new java project called 'WorkflowSim' (it doesn't have to be 'WorkflowSim'). Right click your project, choose 'Import'. Click 'Git'->'Projects from Git'. Set the URL to be "https://github.com/chenww05/WorkflowSim-1.0.git". And then you will see a branch called 'master', tick it and continue. And you don't need import projects again so just cancel. 
+### Adding External Libraries
+Ensure all JAR files in `lib/` are present in your Java project's Build Path:
+1. `lib/commons-math3-3.2.jar`
+2. `lib/flanagan.jar`
+3. `lib/jdom-2.0.0.jar`
 
-1.4 Import Source Files and Libraries
+---
 
-Right click the project again and choose 'Properties'. Go to 'Java Build Path'. Link two source directories (your_repo_root/examples, your_repo_root/sources)to the source folders. Add two external JARs (your_repo_root/lib/flanagan.jar and your_repo_root/lib/jdom-2.0.0.jar) to the Libraries.  
+## ⚡ Quickstart & Running Comparisons
 
-1.5 Run an Example
+You can execute the example classes directly to run simulations and compare algorithm metrics.
 
-Run an example i.e., org.workflowsim.examples.WorkflowSimBasicExample1.java. Open WorkflowSimBasicExample1.java, replace the 
+### 1. Running CASSTO
+Run [`CASSTO_1.java`](examples/org/workflowsim/examples/CASSTO_1.java):
+```java
+// Configure target workflow DAX file:
+String daxPath = "config/dax/Montage_1000.xml";
 
-String daxPath = "/Users/chenweiwei/Work/WorkflowSim-1.0/config/dax/Montage_100.xml";
+// Set planning algorithm:
+Parameters.PlanningAlgorithm pln_method = Parameters.PlanningAlgorithm.CASSTO;
+Parameters.SchedulingAlgorithm sch_method = Parameters.SchedulingAlgorithm.STATIC;
+```
 
-with your real physical file path. Right click on WorkflowSimBasicExample1.java and choose 'Run File'. You should be able to see some output:
+### 2. Running Comparative Baselines
+- **HICA**: Run [`HICA.java`](examples/org/workflowsim/examples/HICA.java)
+- **GA**: Run [`GA_1.java`](examples/org/workflowsim/examples/GA_1.java)
+- **HEFT**: Run [`HEFTPlanningAlgorithmExample1.java`](examples/org/workflowsim/examples/planning/HEFTPlanningAlgorithmExample1.java)
+- **DHEFT**: Run [`DHEFTPlanningAlgorithmExample1.java`](examples/org/workflowsim/examples/planning/DHEFTPlanningAlgorithmExample1.java)
 
-98        SUCCESS        2            0            6.91        263.78            270.69            8
-99        SUCCESS        2            0            0.83        270.69            271.52            9
+### 3. Fair Benchmarking Setup
+To maintain consistency during comparative evaluation:
+- Use the **same DAX file** (e.g., `Montage_1000.xml`, `CyberShake_1000.xml`).
+- Maintain the **same VM pool** (Default: 20 heterogeneous VMs with cyclic 1000 / 2000 / 3000 MIPS).
+- Use `STATIC` scheduling mode so the planner's VM mappings are preserved during simulation execution.
 
-### 2. Use WorkflowSim with GitHub/NetBeans
+---
 
-2.1 Register a GitHub account and fork your own branch
+## 📊 Sample Output
 
-It is the same to 1.1.
+When running `CASSTO_1.java`, execution logs and performance metrics are displayed in the console:
 
-2.2 Install Git
+```plaintext
+CASSTO planning: 1000 tasks, 20 VMs.
+CASSTO iter 1 best fitness = 0.4812
+CASSTO iter 25 best fitness = 0.3951
+CASSTO iter 50 best fitness = 0.3542
+CASSTO iter 100 best fitness = 0.3128
+CASSTO planning finished, best fitness = 0.3128
 
-Go to 'Teams'->'Available Plugins'. Search for 'Git' and install it. 
+========== CASSTO RESULTS ==========
+Number of jobs: 1000
+Makespan: 218.45
+```
 
-2.3 Check out your source codes
+---
 
-First, create a new java project with Existing Sources called 'WorkflowSim' (it doesn't have to be 'WorkflowSim'). Right click this project and choose 'Set as Main Project' for convenience. 
-Right click this project again and choose 'Versioning'->'Initialize Git Repository'. You don't need to change the root path, just click 'OK'. 
+## 📖 Citation & References
 
-Right click the project and choose 'Git'->'Remote'->'Pull', set the 'Repository URL' to be 'https://github.com/chenww05/WorkflowSim-1.0.git' and the 'Remote name' to be 'master'. Click 'OK' and you will see a branch called 'master', tick it and continue. 
+If you use this implementation in your research, please cite the following papers:
 
-2.4 Import Source Files and Libraries
+```bibtex
+@article{hameed2026cassto,
+  title={CASSTO: a bio-inspired metaheuristic for QoS-oriented scientific workflow scheduling in cloud computing},
+  author={Hameed, R. and others},
+  journal={The Journal of Supercomputing},
+  year={2026}
+}
 
-After a while the download is down, right click the project again and choose 'Project Properties'. Go to 'Sources', click 'Add Folder' and choose two folders (your_repo_root/examples and your_repo_root/sources). Go to 'Libraries', add all jars  (your_repo_root/lib/*.jar). 
+@article{chen2012workflowsim,
+  title={WorkflowSim: A Toolkit for Simulating Scientific Workflows in Distributed Environments},
+  author={Chen, Weiwei and Deelman, Ewa},
+  journal={2012 IEEE 8th International Conference on E-Science},
+  pages={1--8},
+  year={2012},
+  publisher={IEEE}
+}
+```
 
-2.5 Run an Example
+---
 
-The same to 1.5. 
-
-### 3. Use WorkflowSim with Eclipse but without GitHub
-( If you don't want to contribute back to WorkflowSim with your codes, you can use WorkflowSim without GitHub. )
-
-3.1 Download Source Files. 
-
-Skip 1.1 and 1.2. Different to 1.3, we download source files directly from https://github.com/WorkflowSim/WorkflowSim-1.0/archive/master.zip and unzip it to your_repo_root. 
-
-3.2 Switch to 1.4 and continue with the rest steps (1.5). 
-
-### 4. Use WorkflowSim with NetBeans but without GitHub
-
-4.1 Download Source Files
-
-The same to 3.1. 
-
-4.2 Switch to 2.4 and continue with the rest steps (2.5).
-
-### Authors and Contributors
-This page is written by Weiwei Chen @chenww05. For details or bug reports, please contact the author. 
-
-### Support or Contact
-Please send an email to support@workflowsim.org. We appreciate your contribution to this project and please go to github to submit your bug report.  
-Many of the questions may have been answered in our wiki pages: https://github.com/WorkflowSim/WorkflowSim-1.0/wiki/_pages
-### Mailing Lists
-
-WorkflowSim Announce
-Message about new release or updates
-workflowsim-announce@googlegroups.com
-
-WorkflowSim Users
-Messages about WorkflowSim related questions/reports
-workflowsim-user@googlegroups.com
-
-WorkflowSim Developers
-Messages about WorkflowSim development
-workflowsim-dev@googlegroups.com
-
-
-
+## 📄 License
+This software is distributed under the Apache License Version 2.0. See [`license.txt`](license.txt) and [`license-workflowsim.txt`](license-workflowsim.txt) for full details.
