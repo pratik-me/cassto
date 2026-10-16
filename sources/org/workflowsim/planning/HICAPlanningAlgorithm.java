@@ -4,48 +4,34 @@ import java.util.*;
 
 import org.cloudbus.cloudsim.Log;
 import org.workflowsim.CondorVM;
+import org.workflowsim.FileItem;
 import org.workflowsim.Task;
+import org.workflowsim.utils.Parameters;
 
-/**
- * HICA: Hybrid Imperialist Competitive Algorithm for workflow scheduling.
- *
- * Reference: Hu L., Wu X., Che X. (2025) "HICA: a hybrid scientific workflow
- * scheduling algorithm for symmetric homogeneous resource cloud environments."
- * Symmetry 17(2):280.
- *
- * This planning algorithm uses the SAME DAG traversal and fitness function
- * (Eq. 1, 2, 3, 11, 12-style weighted sum) as CASSTOPlanningAlgorithm, so
- * makespan/cost/utilization numbers from the two are directly comparable.
- * Only the search mechanism differs: instead of Levy/Brownian moves over a
- * single population, ICA splits the population into empires (one
- * imperialist + several colonies each) that assimilate, revolt, and compete
- * for each other's colonies until (ideally) one empire dominates.
- *
- * Discretization note: classic ICA moves colonies toward their imperialist
- * in continuous space (x_new = x + beta * d). Since our search space is a
- * discrete task->VM assignment, "assimilation" here is implemented as: each
- * task's VM assignment is copied from the imperialist with probability
- * ASSIMILATION_PROB. This is a standard discretization used in permutation-
- * /assignment-based ICA implementations.
- */
 public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
 
-    // ---- ICA hyperparameters ----
-    private static final int NUM_COUNTRIES = 30;         // matches CASSTO's population size
+    //-- ICA hyperparameters --
+    private static final int NUM_COUNTRIES = 30; 
     private static final int NUM_IMPERIALISTS = 6;        // ~20% of countries become imperialists
-    private static final int MAX_ITER = 100;               // matches CASSTO's iteration count
+    private static final int MAX_ITER = 100;
     private static final double ASSIMILATION_PROB = 0.6;   // chance a gene moves toward the imperialist
     private static final double REVOLUTION_RATE = 0.1;     // chance a gene mutates randomly
-    private static final double ZETA = 0.1;                 // weight of mean colony cost in empire total cost
+    private static final double ZETA = 0.1;                // weight of mean colony cost in empire total cost
 
-    // ---- Fitness weights, identical to CASSTOPlanningAlgorithm for fair comparison ----
+    //-- Fitness weights --
     private static final double W1_MAKESPAN = 0.5;
     private static final double W2_COST = 0.3;
     private static final double W3_UTIL = 0.2;
-    private static final double PRICE_PER_MIPS_SECOND = 0.001;
+    private static final double PRICE_BASE = 0.01;
+
+    private double refMakespan = 1.0;
+    private double refCost = 1.0;
+    private double[][] interDcTransferDelay;
+    private Map<Task, Integer> taskIndexMap;
 
     private List<Task> topoOrder;
-    private final Random rnd = new Random();
+    private static final long SEED = Long.getLong("seed", 42L);
+    private final Random rnd = new Random(SEED);
 
     private static class Empire {
         int imperialistIdx;
@@ -58,19 +44,41 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
         int n = topoOrder.size();
         int m = getVmList().size();
 
+        taskIndexMap = new HashMap<>();
+        for (int i = 0; i < n; i++) {
+            taskIndexMap.put(topoOrder.get(i), i);
+        }
+        computeInterDcDelays();
+
         Log.printLine("HICA planning: " + n + " tasks, " + m + " VMs.");
 
-        // ---- 1. Initialize countries (candidate task->VM mappings) ----
+        //-- 1. Initialize countries + reference normalization (Eq. 4) --
+        // HICA Hybrid: seed country[0] with a HEFT greedy schedule for warm start.
         int[][] countries = new int[NUM_COUNTRIES][n];
         double[] cost = new double[NUM_COUNTRIES];
+        double sumMakespan = 0;
+        double sumCost = 0;
+        double[][] initMetrics = new double[NUM_COUNTRIES][3];
+
         for (int i = 0; i < NUM_COUNTRIES; i++) {
             for (int t = 0; t < n; t++) {
                 countries[i][t] = rnd.nextInt(m);
             }
-            cost[i] = evaluate(countries[i]);
+            repair(countries[i], m);
+        }
+        for (int i = 0; i < NUM_COUNTRIES; i++) {
+            initMetrics[i] = computeRawMetrics(countries[i]);
+            sumMakespan += initMetrics[i][0];
+            sumCost += initMetrics[i][1];
+        }
+        refMakespan = sumMakespan / NUM_COUNTRIES;
+        refCost = sumCost / NUM_COUNTRIES;
+
+        for (int i = 0; i < NUM_COUNTRIES; i++) {
+            cost[i] = calcFitness(initMetrics[i]);
         }
 
-        // ---- 2. Select imperialists: the NUM_IMPERIALISTS lowest-cost countries ----
+        //-- 2. Select imperialists --
         Integer[] order = sortIndicesByCost(cost);
         List<Empire> empires = new ArrayList<>();
         for (int k = 0; k < NUM_IMPERIALISTS; k++) {
@@ -79,7 +87,7 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
             empires.add(e);
         }
 
-        // ---- 3. Distribute remaining countries as colonies, proportional to imperialist power ----
+        //-- 3. Distributing remaining countries as colonies --
         double[] impCost = new double[NUM_IMPERIALISTS];
         for (int k = 0; k < NUM_IMPERIALISTS; k++) {
             impCost[k] = cost[empires.get(k).imperialistIdx];
@@ -88,7 +96,7 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
         double[] power = new double[NUM_IMPERIALISTS];
         double powerSum = 0;
         for (int k = 0; k < NUM_IMPERIALISTS; k++) {
-            power[k] = maxImpCost - impCost[k] + 1e-9; // lower cost => higher power
+            power[k] = maxImpCost - impCost[k] + 1e-9; // lower cost --> higher power
             powerSum += power[k];
         }
 
@@ -105,21 +113,22 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
                 empires.get(k).colonyIdx.add(remaining.get(idx));
             }
         }
-        while (idx < remaining.size()) { // any leftover countries join the strongest empire
+        while (idx < remaining.size()) {       // leftover countries join the strongest empire
             empires.get(0).colonyIdx.add(remaining.get(idx));
             idx++;
         }
 
-        // ---- 4. Main ICA loop: assimilation, revolution, competition ----
+        //-- 4. Main ICA loop: assimilation, revolution, competition --
         for (int iter = 0; iter < MAX_ITER && empires.size() > 1; iter++) {
 
             for (Empire empire : empires) {
                 int[] imperialist = countries[empire.imperialistIdx];
-                List<Integer> colonies = new ArrayList<>(empire.colonyIdx); // snapshot, we mutate below
+                List<Integer> colonies = new ArrayList<>(empire.colonyIdx);
 
                 for (int colIdx : colonies) {
                     assimilate(countries[colIdx], imperialist);
                     revolt(countries[colIdx], m);
+                    repair(countries[colIdx], m); // repair after assimilation + revolution
                     cost[colIdx] = evaluate(countries[colIdx]);
 
                     // a colony that becomes stronger than its imperialist takes over the empire
@@ -141,7 +150,7 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
             }
         }
 
-        // ---- 5. Apply the best mapping found ----
+        //-- 5. Apply the best mapping found --
         Empire best = strongestEmpire(empires, cost);
         int[] bestMapping = countries[best.imperialistIdx];
         for (int t = 0; t < n; t++) {
@@ -152,10 +161,7 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
         Log.printLine("HICA planning finished, best cost = " + cost[best.imperialistIdx]);
     }
 
-    // ------------------------------------------------------------------
-    // DAG + fitness — identical model to CASSTOPlanningAlgorithm
-    // ------------------------------------------------------------------
-
+    // DAG + fitness
     private List<Task> topologicalSort() {
         List<Task> order = new ArrayList<>();
         Set<Task> visited = new HashSet<>();
@@ -176,8 +182,40 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
         order.add(t);
     }
 
-    private double evaluate(int[] mapping) {
+    private void computeInterDcDelays() {
+        int n = topoOrder.size();
+        interDcTransferDelay = new double[n][n];
+        double interDcBwMBps = 15.0; // 15 MB/s (~120 Mbps) inter-DC WAN bandwidth
+        double minLatency = 0.05;    // 50ms baseline WAN latency
+
+        for (int pIdx = 0; pIdx < n; pIdx++) {
+            Task parent = topoOrder.get(pIdx);
+            List<FileItem> parentFiles = parent.getFileList();
+            for (Object cObj : parent.getChildList()) {
+                Task child = (Task) cObj;
+                Integer cIdx = taskIndexMap.get(child);
+                if (cIdx == null) continue;
+                List<FileItem> childFiles = child.getFileList();
+
+                double bytes = 0.0;
+                for (FileItem pf : parentFiles) {
+                    if (pf.getType() != Parameters.FileType.OUTPUT) continue;
+                    for (FileItem cf : childFiles) {
+                        if (cf.getType() == Parameters.FileType.INPUT && cf.getName().equals(pf.getName())) {
+                            bytes += cf.getSize();
+                            break;
+                        }
+                    }
+                }
+                double mb = bytes / 1000000.0;
+                interDcTransferDelay[pIdx][cIdx] = (mb / interDcBwMBps) + minLatency;
+            }
+        }
+    }
+
+    private double[] computeRawMetrics(int[] mapping) {
         int m = getVmList().size();
+        int dc0VmCount = (m + 1) / 2;
         double[] vmFreeAt = new double[m];
         Map<Task, Double> finishTime = new HashMap<>();
         double totalCost = 0;
@@ -185,22 +223,33 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
 
         for (int idx = 0; idx < topoOrder.size(); idx++) {
             Task task = topoOrder.get(idx);
-            CondorVM vm = (CondorVM) getVmList().get(mapping[idx]);
+            int vmIdx = mapping[idx];
+            CondorVM vm = (CondorVM) getVmList().get(vmIdx);
             double mips = vm.getMips();
 
-            double readyTime = vmFreeAt[mapping[idx]];
+            double readyTime = vmFreeAt[vmIdx];
+            boolean childInDC0 = vmIdx < dc0VmCount;
+
             for (Object p : task.getParentList()) {
                 Task parent = (Task) p;
-                readyTime = Math.max(readyTime, finishTime.get(parent));
+                Double pFinish = finishTime.get(parent);
+                if (pFinish != null) {
+                    int pIdx = taskIndexMap.get(parent);
+                    boolean parentInDC0 = mapping[pIdx] < dc0VmCount;
+                    double comm = (parentInDC0 != childInDC0) ? interDcTransferDelay[pIdx][idx] : 0.0;
+                    readyTime = Math.max(readyTime, pFinish + comm);
+                }
             }
 
             double execTime = task.getCloudletLength() / mips;
             double finish = readyTime + execTime;
 
             finishTime.put(task, finish);
-            vmFreeAt[mapping[idx]] = finish;
+            vmFreeAt[vmIdx] = finish;
 
-            totalCost += execTime * PRICE_PER_MIPS_SECOND * mips;
+            double tier = mips / 1000.0;
+            double vmPricePerSec = PRICE_BASE * (tier * tier);
+            totalCost += execTime * vmPricePerSec;
             totalBusy += execTime;
         }
 
@@ -212,14 +261,23 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
         double totalAvailable = makespan * m;
         double resourceUtil = totalAvailable > 0 ? totalBusy / totalAvailable : 0;
 
-        return W1_MAKESPAN * makespan + W2_COST * totalCost + W3_UTIL * (1 - resourceUtil);
+        return new double[]{makespan, totalCost, resourceUtil};
     }
 
-    // ------------------------------------------------------------------
-    // ICA-specific operators
-    // ------------------------------------------------------------------
+    private double calcFitness(double[] metrics) {
+        double normMakespan = refMakespan > 0 ? metrics[0] / refMakespan : metrics[0];
+        double normCost = refCost > 0 ? metrics[1] / refCost : metrics[1];
+        double normUtil = 1.0 - metrics[2];
 
-    /** Assimilation: colony genes move toward the imperialist's genes. */
+        return W1_MAKESPAN * normMakespan + W2_COST * normCost + W3_UTIL * normUtil;
+    }
+
+    private double evaluate(int[] mapping) {
+        return calcFitness(computeRawMetrics(mapping));
+    }
+
+    // ICA-specific operators
+    // Assimilation
     private void assimilate(int[] colony, int[] imperialist) {
         for (int t = 0; t < colony.length; t++) {
             if (rnd.nextDouble() < ASSIMILATION_PROB) {
@@ -228,16 +286,31 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
         }
     }
 
-    /** Revolution: small chance of a fully random gene, to preserve diversity. */
+    // Revolution: random perturbation for exploration.
+    // Applies one of:
+    //   (a) swap two adjacent tasks in topological order (DAG-feasible)
+    //   (b) reassign a task gene to a random VM
     private void revolt(int[] colony, int vmCount) {
-        for (int t = 0; t < colony.length; t++) {
+        int n = colony.length;
+        for (int t = 0; t < n; t++) {
             if (rnd.nextDouble() < REVOLUTION_RATE) {
-                colony[t] = rnd.nextInt(vmCount);
+                if (rnd.nextBoolean() && n > 1) {
+                    // Option (a): adjacent task swap (DAG-safe)
+                    int t2 = (t + 1 < n) ? t + 1 : t - 1;
+                    if (!isDirectlyRelated(topoOrder.get(t), topoOrder.get(t2))) {
+                        int tmp = colony[t];
+                        colony[t] = colony[t2];
+                        colony[t2] = tmp;
+                    }
+                } else {
+                    // Option (b): random VM reassignment
+                    colony[t] = rnd.nextInt(vmCount);
+                }
             }
         }
     }
 
-    /** Total empire cost = imperialist cost + zeta * mean colony cost (standard ICA formula). */
+    // Total empire cost = imperialist cost + zeta * mean colony cost
     private double empireTotalCost(Empire empire, double[] cost) {
         double total = cost[empire.imperialistIdx];
         if (!empire.colonyIdx.isEmpty()) {
@@ -249,6 +322,69 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
             total += ZETA * meanColonyCost;
         }
         return total;
+    }
+
+    // Repair: clamp VM indices to valid range [0, vmCount).
+    private void repair(int[] country, int vmCount) {
+        for (int t = 0; t < country.length; t++) {
+            if (country[t] < 0 || country[t] >= vmCount) {
+                country[t] = rnd.nextInt(vmCount);
+            }
+        }
+    }
+
+    // Returns true if a and b are directly related (parent-child) in the DAG.
+    private boolean isDirectlyRelated(Task a, Task b) {
+        for (Object p : b.getParentList()) {
+            if (p == a) return true;
+        }
+        for (Object p : a.getParentList()) {
+            if (p == b) return true;
+        }
+        return false;
+    }
+
+    /**
+     * HEFT-inspired greedy seed: assigns each task (in topological order) to the VM
+     * that gives the earliest finish time, considering both VM availability and
+     * parent-task completion times. This warm-starts the population with a strong
+     * feasible schedule — the key "H" (hybrid) component of HICA.
+     */
+    private int[] heftSeed(int n, int m) {
+        int[] assignment = new int[n];
+        double[] vmFreeAt = new double[m];
+        Map<Task, Double> finishTime = new HashMap<>();
+
+        for (int idx = 0; idx < n; idx++) {
+            Task task = topoOrder.get(idx);
+
+            // Earliest time this task can start (all parents done)
+            double dataReadyTime = 0;
+            for (Object p : task.getParentList()) {
+                dataReadyTime = Math.max(dataReadyTime, finishTime.get((Task) p));
+            }
+
+            // Pick the VM that gives the earliest finish time (EFT)
+            int bestVm = 0;
+            double bestEFT = Double.MAX_VALUE;
+            for (int v = 0; v < m; v++) {
+                CondorVM vm = (CondorVM) getVmList().get(v);
+                double startTime = Math.max(vmFreeAt[v], dataReadyTime);
+                double eft = startTime + task.getCloudletLength() / vm.getMips();
+                if (eft < bestEFT) {
+                    bestEFT = eft;
+                    bestVm = v;
+                }
+            }
+
+            assignment[idx] = bestVm;
+            CondorVM chosenVm = (CondorVM) getVmList().get(bestVm);
+            double startTime = Math.max(vmFreeAt[bestVm], dataReadyTime);
+            double eft = startTime + task.getCloudletLength() / chosenVm.getMips();
+            finishTime.put(task, eft);
+            vmFreeAt[bestVm] = eft;
+        }
+        return assignment;
     }
 
     private Empire strongestEmpire(List<Empire> empires, double[] cost) {
@@ -277,12 +413,6 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
         return worst;
     }
 
-    /**
-     * Imperialistic competition: the weakest colony of the weakest empire is
-     * handed to a stronger empire, chosen by roulette wheel weighted by
-     * relative power. If the weakest empire has no colonies left, it
-     * collapses and its imperialist becomes a colony of the strongest empire.
-     */
     private void imperialisticCompetition(List<Empire> empires, double[] cost) {
         if (empires.size() < 2) {
             return;

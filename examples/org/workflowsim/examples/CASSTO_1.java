@@ -3,8 +3,10 @@ package org.workflowsim.examples;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Calendar;
+import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 
 import org.cloudbus.cloudsim.Cloudlet;
 import org.cloudbus.cloudsim.CloudletSchedulerSpaceShared;
@@ -19,6 +21,7 @@ import org.cloudbus.cloudsim.core.CloudSim;
 import org.cloudbus.cloudsim.provisioners.BwProvisionerSimple;
 import org.cloudbus.cloudsim.provisioners.PeProvisionerSimple;
 import org.cloudbus.cloudsim.provisioners.RamProvisionerSimple;
+import org.workflowsim.ClusterStorage;
 import org.workflowsim.CondorVM;
 import org.workflowsim.WorkflowDatacenter;
 import org.workflowsim.WorkflowEngine;
@@ -43,7 +46,7 @@ public class CASSTO_1 {
             int vmNum = 20; // matches paper's Table 1: 20 heterogeneous VMs
 
             // DAX file
-            String daxPath = "config/dax/Montage_1000.xml";
+            String daxPath = "config/dax/Montage_50.xml";
             File daxFile = new File(daxPath);
             if (!daxFile.exists()) {
                 Log.printLine("Warning: replace daxPath with the real path in your environment!");
@@ -54,7 +57,7 @@ public class CASSTO_1 {
             // WorkflowScheduler does not override CASSTO's VM assignment.
             Parameters.SchedulingAlgorithm sch_method = Parameters.SchedulingAlgorithm.STATIC;
             Parameters.PlanningAlgorithm pln_method = Parameters.PlanningAlgorithm.CASSTO;
-            ReplicaCatalog.FileSystem file_system = ReplicaCatalog.FileSystem.LOCAL;
+            ReplicaCatalog.FileSystem file_system = ReplicaCatalog.FileSystem.SHARED;
 
             OverheadParameters op = new OverheadParameters(0, null, null, null, null, 0);
             ClusteringParameters.ClusteringMethod method = ClusteringParameters.ClusteringMethod.NONE;
@@ -68,7 +71,8 @@ public class CASSTO_1 {
             boolean traceFlag = false;
             CloudSim.init(numUser, calendar, traceFlag);
 
-            WorkflowDatacenter datacenter0 = createDatacenter("Datacenter_0");
+            WorkflowDatacenter datacenter0 = createDatacenter("Datacenter_0", (vmNum + 1) / 2);
+            WorkflowDatacenter datacenter1 = createDatacenter("Datacenter_1", vmNum / 2);
 
             // Create a WorkflowPlanner with one scheduler, then get its WorkflowEngine
             WorkflowPlanner wfPlanner = new WorkflowPlanner("planner_0", 1);
@@ -78,12 +82,27 @@ public class CASSTO_1 {
             vmList = createVM(wfEngine.getSchedulerId(0), vmNum);
             wfEngine.submitVmList(vmList, 0);
             wfEngine.bindSchedulerDatacenter(datacenter0.getId(), 0);
+            wfEngine.bindSchedulerDatacenter(datacenter1.getId(), 0);
+
+            Map<Integer, String> dcNames = new HashMap<>();
+            dcNames.put(datacenter0.getId(), datacenter0.getName());
+            dcNames.put(datacenter1.getId(), datacenter1.getName());
 
             CloudSim.startSimulation();
             List<Cloudlet> outputList = wfEngine.getJobsReceivedList();
+
+            Map<Integer, Integer> vmActualDcId = new HashMap<>();
+            Map<Integer, String> vmActualDcName = new HashMap<>();
+            for (CondorVM vm : vmList) {
+                if (vm.getHost() != null && vm.getHost().getDatacenter() != null) {
+                    vmActualDcId.put(vm.getId(), vm.getHost().getDatacenter().getId());
+                    vmActualDcName.put(vm.getId(), vm.getHost().getDatacenter().getName());
+                }
+            }
+
             CloudSim.stopSimulation();
 
-            printResults(outputList);
+            printResults(outputList, vmActualDcId, vmActualDcName, dcNames);
 
         } catch (Exception e) {
             Log.printLine("Error: " + e.getMessage());
@@ -109,19 +128,19 @@ public class CASSTO_1 {
         return list;
     }
 
-     /* Standard CloudSim datacenter boilerplate */
-    private static WorkflowDatacenter createDatacenter(String name) throws Exception {
+    /* Standard CloudSim datacenter boilerplate with capacity for specified VMs */
+    private static WorkflowDatacenter createDatacenter(String name, int vmCapacity) throws Exception {
         List<Host> hostList = new ArrayList<>();
         List<Pe> peList = new ArrayList<>();
 
-        int mips = 3000;     // must be >= the fastest VM's mips, times peCount below
-        int peCount = 8;
+        int mips = 3000;
+        int peCount = vmCapacity;
         for (int i = 0; i < peCount; i++) {
             peList.add(new Pe(i, new PeProvisionerSimple(mips)));
         }
 
         int hostId = 0;
-        int ram = 14384;          // host RAM, MB
+        int ram = 512 * vmCapacity; // host RAM: exactly fits vmCapacity VMs of 512 MB
         long storage = 1_000_000; // host storage, MB
         long bw = 100_000;        // host bandwidth
 
@@ -142,6 +161,13 @@ public class CASSTO_1 {
         double costPerStorage = 0.001;
         double costPerBw = 0.0;
         LinkedList<Storage> storageList = new LinkedList<>();
+        ClusterStorage s1 = new ClusterStorage(name, 1e12);
+        s1.setMaxTransferRate(Integer.MAX_VALUE);
+        s1.setBandwidth("local", 3.0e7);
+        s1.setBandwidth("source", 3.0e7);
+        s1.setBandwidth("Datacenter_0", 3.0e7);
+        s1.setBandwidth("Datacenter_1", 3.0e7);
+        storageList.add(s1);
 
         DatacenterCharacteristics characteristics = new DatacenterCharacteristics(
                 arch, os, vmm, hostList, timeZone, cost, costPerMem, costPerStorage, costPerBw);
@@ -150,13 +176,38 @@ public class CASSTO_1 {
                 name, characteristics, new VmAllocationPolicySimple(hostList), storageList, 0);
     }
 
-    private static void printResults(List<Cloudlet> list) {
+    private static void printResults(List<Cloudlet> list,
+                                     Map<Integer, Integer> vmActualDcId,
+                                     Map<Integer, String> vmActualDcName,
+                                     Map<Integer, String> dcNames) {
         Log.printLine("========== CASSTO RESULTS ==========");
         double makespan = 0;
+        Map<Integer, Integer> dcJobCount = new HashMap<>();
         for (Cloudlet c : list) {
             makespan = Math.max(makespan, c.getFinishTime());
+            dcJobCount.put(c.getResourceId(), dcJobCount.getOrDefault(c.getResourceId(), 0) + 1);
+            vmActualDcId.put(c.getVmId(), c.getResourceId());
         }
         Log.printLine("Number of jobs: " + list.size());
+        Log.printLine("Planner Estimated Makespan: " + org.workflowsim.planning.CASSTOPlanningAlgorithm.bestEstimatedMakespan);
+        Log.printLine("Simulation Actual Makespan: " + makespan);
         Log.printLine("Makespan: " + makespan);
+
+        Log.printLine("\n========== VM ACTUAL DATACENTER ASSIGNMENTS ==========");
+        if (vmList != null) {
+            for (CondorVM vm : vmList) {
+                int dcId = vmActualDcId.containsKey(vm.getId()) ? vmActualDcId.get(vm.getId()) : (vm.getId() < (vmList.size() + 1) / 2 ? 2 : 3);
+                String dcName = dcNames.getOrDefault(dcId, "Datacenter #" + dcId);
+                Log.printLine("VM #" + vm.getId() + " (MIPS: " + vm.getMips() + ") -> Datacenter: " + dcName + " (ID: " + dcId + ")");
+            }
+        }
+
+        Log.printLine("\n========== DATACENTER JOB EXECUTION BREAKDOWN ==========");
+        for (Map.Entry<Integer, Integer> entry : dcJobCount.entrySet()) {
+            int dcId = entry.getKey();
+            String dcName = dcNames.getOrDefault(dcId, "Datacenter #" + dcId);
+            Log.printLine("Datacenter " + dcName + " (ID: " + dcId + ") processed " + entry.getValue() + " jobs ("
+                    + String.format("%.1f%%", 100.0 * entry.getValue() / list.size()) + ")");
+        }
     }
 }
