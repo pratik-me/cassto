@@ -3,14 +3,13 @@ package org.workflowsim.planning;
 import java.util.*;
 
 import org.cloudbus.cloudsim.Log;
-import org.workflowsim.FileItem;
 import org.workflowsim.Task;
-import org.workflowsim.utils.Parameters;
 
 public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
     private static final int POP_SIZE = 30;
-    private static final int MAX_ITER = 100;
     private static final double LEVY_LAMBDA = 1.5;
+    private static final double SIGMA_LEVY = computeSigma(LEVY_LAMBDA);
+    private static final double INV_LEVY_LAMBDA = 1.0 / LEVY_LAMBDA;
 
     private static final double P_BROWNIAN_MIN = 0.2;
     private static final double P_BROWNIAN_MAX = 0.8;
@@ -18,27 +17,32 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
     private static final double LEVY_ALPHA = 2.0;
     private static final double URGENT_BIAS = 0.7;
 
+    private static final boolean DEDUPE = Boolean.parseBoolean(System.getProperty("cassto.dedupe", "true"));
+    private static final int STALL_LIMIT = Integer.getInteger("cassto.stallLimit", 200);
+
     public static double bestEstimatedMakespan = 0.0;
 
     private Map<Task, Boolean> urgent;
     private int[] urgentIdx;
-    private double[][] interDcTransferDelay;
     private List<Integer>[] vmNeighbors;
 
     private int brownianCount = 0;
     private int levyCount = 0;
     private int brownianWins = 0;
     private int levyWins = 0;
+    private int brownianNeutral = 0;
+    private int levyNeutral = 0;
+    private int cacheAdopted = 0;
+    private int dedupeCount = 0;
     private long totalLevySteps = 0;
 
     @Override
     public void run() {
         prepare();
 
-        computeInterDcDelays();
         computeVmNeighbors(m);
 
-        List<Task> baseTopoOrder = topologicalSort();
+        List<Task> baseTopoOrder = decodeOrder(new int[n]);
         urgent = computeUrgency(baseTopoOrder);
 
         List<Integer> u = new ArrayList<>();
@@ -56,6 +60,10 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
         levyCount = 0;
         brownianWins = 0;
         levyWins = 0;
+        brownianNeutral = 0;
+        levyNeutral = 0;
+        cacheAdopted = 0;
+        dedupeCount = 0;
         totalLevySteps = 0;
 
         Log.printLine("CASSTO planning: " + n + " tasks, " + m + " VMs, "
@@ -73,14 +81,18 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
         Individual best = bestOf(Arrays.asList(population)).cloneIndividual();
         double bestFitness = best.fitness;
 
-        // -- 2. Main search loop (Algorithm 1: Lines 8-34), stops on evaluation budget --
+        // -- 2. Main search loop (Algorithm 1: Lines 8-34), stops on evaluation budget
         int iter = 0;
+        int sinceFresh = 0;
         int maxIter = 10 * EVAL_BUDGET;
         while (budgetLeft() && iter < maxIter) {
-            double pBrownian = P_BROWNIAN_MIN + (P_BROWNIAN_MAX - P_BROWNIAN_MIN) * Math.min(1.0, (double) iter / MAX_ITER);
+            int before = evalCount;
+            double pBrownian = P_BROWNIAN_MIN
+                    + (P_BROWNIAN_MAX - P_BROWNIAN_MIN) * Math.min(1.0, evalCount / (double) EVAL_BUDGET);
 
             for (int i = 0; i < POP_SIZE; i++) {
-                if (!budgetLeft()) break;
+                if (!budgetLeft())
+                    break;
 
                 boolean brownian = (rnd.nextDouble() < pBrownian);
                 Individual candidate = population[i].cloneIndividual();
@@ -91,22 +103,33 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                     levyMove(candidate, m);
                 }
 
-                evaluate(candidate);
-
+                boolean attempted = candidate.dirty;
+                boolean fresh = evaluate(candidate);
                 boolean wasRegen = isRegenerated[i];
                 isRegenerated[i] = false;
 
-                if (!wasRegen) {
-                    if (brownian) brownianCount++;
-                    else levyCount++;
+                if (attempted && !wasRegen) {
+                    if (brownian)
+                        brownianCount++;
+                    else
+                        levyCount++;
                 }
-
-                if (candidate.fitness < population[i].fitness) {
-                    if (!wasRegen) {
-                        if (brownian) brownianWins++;
-                        else levyWins++;
+                if (candidate.fitness < population[i].fitness - 1e-9) {
+                    if (attempted && !wasRegen) {
+                        if (brownian)
+                            brownianWins++;
+                        else
+                            levyWins++;
+                    }
+                    if (!fresh) {
+                        cacheAdopted++;
                     }
                     population[i] = candidate;
+                } else if (attempted && !wasRegen && Math.abs(candidate.fitness - population[i].fitness) <= 1e-9) {
+                    if (brownian)
+                        brownianNeutral++;
+                    else
+                        levyNeutral++;
                 }
                 if (population[i].fitness < bestFitness) {
                     bestFitness = population[i].fitness;
@@ -114,14 +137,37 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                 }
             }
 
-            // Sort population for diversity injection
+            // Sort population for diversity injection and deduplication
             Integer[] order = sortIndices(population);
 
+            // Deduplicate population
+            if (DEDUPE) {
+                Set<String> seen = new HashSet<>();
+                for (int idx : order) {
+                    String sig = signature(population[idx]);
+                    if (!seen.add(sig)) {
+                        if (!budgetLeft())
+                            break;
+                        population[idx] = randomIndividual();
+                        evaluate(population[idx]);
+                        if (population[idx].fitness < bestFitness) {
+                            bestFitness = population[idx].fitness;
+                            best = population[idx].cloneIndividual();
+                        }
+                        isRegenerated[idx] = true;
+                        dedupeCount++;
+                    }
+                }
+            }
+
             // Diversity injection: regenerate worst individuals randomly
-            int rCount = Math.max(1, (int) Math.round(0.067 * POP_SIZE));
+            int rCount = 2;
             for (int r = 0; r < rCount; r++) {
-                if (!budgetLeft()) break;
+                if (!budgetLeft())
+                    break;
                 int worstIdx = order[POP_SIZE - 1 - r];
+                if (isRegenerated[worstIdx])
+                    continue;
                 population[worstIdx] = randomIndividual();
                 evaluate(population[worstIdx]);
 
@@ -132,6 +178,13 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                 isRegenerated[worstIdx] = true;
             }
 
+            sinceFresh = (evalCount == before) ? sinceFresh + 1 : 0;
+            if (sinceFresh >= STALL_LIMIT) {
+                Log.printLine("CASSTO stopped early: " + STALL_LIMIT
+                        + " consecutive iterations without fresh evaluations (stagnation).");
+                break;
+            }
+
             if (iter % 10 == 0) {
                 logProgress("CASSTO", iter, best);
                 double avgLevyStep = levyCount > 0 ? (double) totalLevySteps / levyCount : 0.0;
@@ -139,8 +192,12 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                 double lWinRate = levyCount > 0 ? 100.0 * levyWins / levyCount : 0.0;
                 Log.printLine("CASSTO iter " + iter + " | best fit: " + String.format("%.4f", bestFitness)
                         + " | pBrownian: " + String.format("%.2f", pBrownian)
-                        + " | Brownian moves: " + brownianCount + " (wins: " + brownianWins + ", " + String.format("%.1f%%", bWinRate) + ")"
-                        + " | Levy moves: " + levyCount + " (wins: " + levyWins + ", " + String.format("%.1f%%", lWinRate) + ", avgStep: " + String.format("%.2f", avgLevyStep) + ")");
+                        + " | Brownian moves: " + brownianCount + " (wins: " + brownianWins + ", neutral: "
+                        + brownianNeutral + ", "
+                        + String.format("%.1f%%", bWinRate) + ")"
+                        + " | Levy moves: " + levyCount + " (wins: " + levyWins + ", neutral: " + levyNeutral + ", "
+                        + String.format("%.1f%%", lWinRate) + ", avgStep: " + String.format("%.2f", avgLevyStep) + ")"
+                        + " | cacheAdopted: " + cacheAdopted);
             }
             iter++;
         }
@@ -152,58 +209,28 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
         double avgLevyStep = levyCount > 0 ? (double) totalLevySteps / levyCount : 0.0;
         double bWinRate = brownianCount > 0 ? 100.0 * brownianWins / brownianCount : 0.0;
         double lWinRate = levyCount > 0 ? 100.0 * levyWins / levyCount : 0.0;
-        Log.printLine("  -> Brownian moves (local/nearby VM): " + brownianCount + " (improvements: " + brownianWins + ", winRate: " + String.format("%.1f%%", bWinRate) + ")"
-                + "\n  -> Levy moves (global/any VM):       " + levyCount + " (improvements: " + levyWins + ", winRate: " + String.format("%.1f%%", lWinRate) + ", avgStep: " + String.format("%.2f", avgLevyStep) + ")");
+        Log.printLine("  -> Brownian moves (local/nearby VM): " + brownianCount + " (improvements: " + brownianWins
+                + ", neutral: " + brownianNeutral
+                + ", winRate: " + String.format("%.1f%%", bWinRate) + ")"
+                + "\n  -> Levy moves (global/any VM):       " + levyCount + " (improvements: " + levyWins
+                + ", neutral: " + levyNeutral
+                + ", winRate: " + String.format("%.1f%%", lWinRate) + ", avgStep: " + String.format("%.2f", avgLevyStep)
+                + ")"
+                + "\n  -> Cache hits: " + cacheHits + ", Cache adoptions: " + cacheAdopted
+                + "\n  -> Deduplications: " + dedupeCount);
         logFinal("CASSTO", best, iter);
     }
 
-    private void computeInterDcDelays() {
-        int n = taskList.size();
-        interDcTransferDelay = new double[n][n];
-        double interDcBwMBps = 15.0; // 15 MB/s (~120 Mbps) inter-DC WAN bandwidth
-        double minLatency = 0.05;    // 50ms baseline WAN latency
-
-        for (int pIdx = 0; pIdx < n; pIdx++) {
-            Task parent = taskList.get(pIdx);
-            List<FileItem> parentFiles = parent.getFileList();
-            for (Object cObj : parent.getChildList()) {
-                Task child = (Task) cObj;
-                Integer cIdx = taskIndexMap.get(child);
-                if (cIdx == null) continue;
-                List<FileItem> childFiles = child.getFileList();
-
-                double bytes = 0.0;
-                for (FileItem pf : parentFiles) {
-                    if (pf.getType() != Parameters.FileType.OUTPUT) continue;
-                    for (FileItem cf : childFiles) {
-                        if (cf.getType() == Parameters.FileType.INPUT && cf.getName().equals(pf.getName())) {
-                            bytes += cf.getSize();
-                            break;
-                        }
-                    }
-                }
-                double mb = bytes / 1000000.0;
-                // Eq. 8: Comm_i,j = D_i,j / BW_inter
-                interDcTransferDelay[pIdx][cIdx] = (mb / interDcBwMBps) + minLatency;
-            }
-        }
-    }
-
     private void computeVmNeighbors(int m) {
-        int dc0VmCount = (m + 1) / 2;
         vmNeighbors = new List[m];
         for (int v = 0; v < m; v++) {
             vmNeighbors[v] = new ArrayList<>();
-            boolean inDC0 = (v < dc0VmCount);
-            int vTier = v % 3;
             for (int u = 0; u < m; u++) {
-                if (u == v) continue;
-                boolean uInDC0 = (u < dc0VmCount);
-                if (uInDC0 == inDC0) {
-                    int uTier = u % 3;
-                    if (Math.abs(uTier - vTier) <= 1) {
-                        vmNeighbors[v].add(u);
-                    }
+                if (u == v)
+                    continue;
+                if (u != v && dcOfVm(u) == dcOfVm(v)
+                        && Math.max(vmMips(u), vmMips(v)) / Math.min(vmMips(u), vmMips(v)) <= 2.0) {
+                    vmNeighbors[v].add(u);
                 }
             }
             if (vmNeighbors[v].isEmpty()) {
@@ -220,7 +247,8 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                 // (a) Order move: orderSwapMove(ind)
                 orderSwapMove(ind);
             } else {
-                // (b) Nearby VM move: same datacenter and same or adjacent speed tier (true refinement)
+                // (b) Nearby VM move: same datacenter and same or adjacent speed tier (true
+                // refinement)
                 int tIdx = rnd.nextInt(n);
                 int curVm = ind.vm[tIdx];
                 List<Integer> neighbors = vmNeighbors[curVm];
@@ -234,7 +262,7 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
     }
 
     private void levyMove(Individual ind, int vmCount) {
-        double step = LEVY_ALPHA * Math.abs(levySample(LEVY_LAMBDA));
+        double step = LEVY_ALPHA * Math.abs(levySample());
         int moves = Math.min(n, Math.max(1, (int) Math.ceil(step)));
         totalLevySteps += moves;
 
@@ -290,25 +318,7 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
         }
     }
 
-    private List<Task> topologicalSort() {
-        List<Task> order = new ArrayList<>();
-        Set<Task> visited = new HashSet<>();
-        for (Task t : taskList) {
-            visitTask(t, visited, order);
-        }
-        return order;
-    }
 
-    private void visitTask(Task t, Set<Task> visited, List<Task> order) {
-        if (visited.contains(t)) {
-            return;
-        }
-        visited.add(t);
-        for (Object p : t.getParentList()) {
-            visitTask((Task) p, visited, order);
-        }
-        order.add(t);
-    }
 
     // Urgency indicator U_i (Paper Eq. 6 & Critical Path Membership)
     private Map<Task, Boolean> computeUrgency(List<Task> order) {
@@ -349,7 +359,8 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
             criticalPathLength = Math.max(criticalPathLength, totalPath);
         }
 
-        // 4. Mark tasks as urgent if their path is within 5% of the critical path length
+        // 4. Mark tasks as urgent if their path is within 5% of the critical path
+        // length
         Map<Task, Boolean> urgencyMap = new HashMap<>();
         double threshold = (1.0 - 0.05) * criticalPathLength;
         for (Task t : order) {
@@ -359,23 +370,27 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
         return urgencyMap;
     }
 
-    /** Mantegna's algorithm for a symmetric Levy-stable step. */
-    private double levySample(double lambda) {
-        double sigma = Math.pow(
-                (gamma(1 + lambda) * Math.sin(Math.PI * lambda / 2))
-                        / (gamma((1 + lambda) / 2) * lambda * Math.pow(2, (lambda - 1) / 2)),
-                1 / lambda);
-        double u = rnd.nextGaussian() * sigma;
+    /** Precomputed Mantegna scale parameter sigma for Levy distribution. */
+    private static double computeSigma(double lambda) {
+        return Math.pow(
+                (gamma(1 + lambda) * Math.sin(Math.PI * lambda / 2.0))
+                        / (gamma((1 + lambda) / 2.0) * lambda * Math.pow(2.0, (lambda - 1.0) / 2.0)),
+                1.0 / lambda);
+    }
+
+    /** Mantegna's algorithm for a symmetric Levy-stable step using precomputed sigma. */
+    private double levySample() {
+        double u = rnd.nextGaussian() * SIGMA_LEVY;
         double v = rnd.nextGaussian();
-        return u / Math.pow(Math.abs(v), 1 / lambda);
+        return u / Math.pow(Math.abs(v), INV_LEVY_LAMBDA);
     }
 
     /** Lanczos approximation of the Gamma function. */
-    private double gamma(double x) {
+    private static double gamma(double x) {
         double[] g = { 676.5203681218851, -1259.1392167224028, 771.32342877765313,
                 -176.61502916214059, 12.507343278686905, -0.13857109526572012,
                 9.9843695780195716e-6, 1.5056327351493116e-7 };
-        if (x < 0.5) {  
+        if (x < 0.5) {
             return Math.PI / (Math.sin(Math.PI * x) * gamma(1 - x));
         }
         x -= 1;

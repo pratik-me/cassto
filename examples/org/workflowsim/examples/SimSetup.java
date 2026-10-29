@@ -31,15 +31,8 @@ import org.workflowsim.utils.OverheadParameters;
 import org.workflowsim.utils.Parameters;
 import org.workflowsim.utils.ReplicaCatalog;
 
-/**
- * Shared simulation setup helper to ensure identical environment, network transfer rates,
- * VM configurations, and metric reporting across algorithm benchmark drivers (CASSTO, GA, HICA, etc.).
- */
-public class SimSetup {
 
-    /**
-     * Initializes CloudSim and WorkflowSim parameters identically for all planners.
-     */
+public class SimSetup {
     public static boolean setupParameters(int vmNum, String daxPath, Parameters.PlanningAlgorithm pln_method) {
         File daxFile = new File(daxPath);
         if (!daxFile.exists()) {
@@ -179,9 +172,6 @@ public class SimSetup {
         printResults(title, list, vmList, dcNames, null);
     }
 
-    /**
-     * Complete simulation runner executing setup, deployment, simulation run, and result reporting.
-     */
     public static void runSimulation(String algoTitle, Parameters.PlanningAlgorithm pln_method, String daxPath, int vmNum, Double estimatedMakespan) {
         try {
             if (!setupParameters(vmNum, daxPath, pln_method)) {
