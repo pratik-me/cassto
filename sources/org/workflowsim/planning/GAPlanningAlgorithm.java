@@ -19,7 +19,7 @@ import org.workflowsim.Task;
  *
  * JVM properties for the parameter sweep (defaults = paper Sec. 5.1):
  *   -Dga.pop=30  -Dga.pc=0.8  -Dga.pm=0.05  -Dga.tournament=3
- *   -Dga.mutPerGene=true   true: pm applied per gene (n trials/offspring); false: literal L22, once per offspring
+ *   -Dga.mutPerGene=false  false (default): literal paper L22, once per offspring (5%); true: pm applied per gene
  *   -Dga.dedupe=true       drop duplicate schedules before truncation (they otherwise fill the population)
  */
 public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
@@ -28,7 +28,7 @@ public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
     private static final int TOURNAMENT_SIZE = Integer.getInteger("ga.tournament", 3);
     private static final double CROSSOVER_PROB = dbl("ga.pc", 0.8);
     private static final double MUTATION_PROB = dbl("ga.pm", 0.05);
-    private static final boolean MUT_PER_GENE = Boolean.parseBoolean(System.getProperty("ga.mutPerGene", "true"));
+    private static final boolean MUT_PER_GENE = Boolean.parseBoolean(System.getProperty("ga.mutPerGene", "false"));
     private static final boolean DEDUPE = Boolean.parseBoolean(System.getProperty("ga.dedupe", "true"));
 
     @Override
@@ -91,7 +91,7 @@ public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
                 c1 = c[0];
                 c2 = c[1];
             } else {
-                c1 = a.cloneIndividual();                // L17: offspring = parents, stays clean (no re-eval)
+                c1 = a.cloneIndividual();             // L17
                 c2 = b.cloneIndividual();
             }
             mutate(c1);
@@ -174,12 +174,6 @@ public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
         }
     }
 
-    private void reassignToDifferentVm(Individual ind, int task) {
-        if (m < 2) return;
-        int nv = rnd.nextInt(m - 1);
-        ind.vm[task] = nv >= ind.vm[task] ? nv + 1 : nv;
-        ind.dirty = true;
-    }
 
     // =====================================================================
     // Replacement (L31-33): (mu + lambda) truncation, stable so ties favour parents
@@ -203,7 +197,7 @@ public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
             if (seen.add(signature(x))) out.add(x);
             else dupes.add(x);
         }
-        for (Individual x : dupes) {               // only if there were too few distinct schedules
+        for (Individual x : dupes) {     // only if there were too few distinct schedules
             if (out.size() == POP_SIZE) break;
             out.add(x);
         }

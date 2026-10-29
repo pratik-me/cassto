@@ -9,25 +9,6 @@ import org.cloudbus.cloudsim.Log;
 import org.workflowsim.CondorVM;
 import org.workflowsim.Task;
 
-/**
- * Shared base for population-based planners (CASSTO, GA, ...).
- *
- * Everything that must be IDENTICAL across algorithms for a fair comparison lives here:
- *   - the chromosome (Individual): VM per task + priority vector -> Kahn-decoded execution order
- *   - the decoder / repair (precedence feasibility is guaranteed by construction)
- *   - the evaluator (makespan, cost, utilization) and the fitness normalization
- *   - the evaluation budget counter, the seed, and the progress / trace logging
- *   - the order-swap move so that GA and CASSTO use the same rule
- *
- * Subclasses implement run(): call prepare() first, then search, then applySolution(best).
- *
- * JVM properties (all optional):
- *   -Dseed=N            random seed (default 42)
- *   -Devals=N           evaluation budget (default 3000)
- *   -Dw1= -Dw2= -Dw3=   fitness weights (default 1, 0, 0 = makespan only)
- *   -DsameVmSwap=true   order-swap partner is chosen from the same VM (default false = literal paper)
- *   -Dtrace=file.csv    append "seed,algo,step,evals,bestMakespan" rows for convergence plots
- */
 public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
 
     // ---------- shared experiment settings ----------
@@ -66,11 +47,11 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
     // ---------- chromosome ----------
     protected static class Individual {
         public int[] vm;             // task index -> VM index
-        public int[] priority;       // task index -> priority (lower = earlier); rewritten to ranks by decode
+        public int[] priority;       // task index -> priority (lower = earlier)
         public List<Task> order;     // decoded, DAG-feasible execution order
         public double fitness;
-        public double[] rawMetrics;  // [makespan, cost, utilization]
-        public boolean dirty = true; // true = fitness is stale and evaluate() must recompute
+        public double[] rawMetrics;
+        public boolean dirty = true;
 
         public Individual(int n) {
             vm = new int[n];
@@ -90,9 +71,6 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
         }
     }
 
-    // =====================================================================
-    // Setup
-    // =====================================================================
     @SuppressWarnings("rawtypes")
     protected void prepare() {
         rnd = new Random(SEED);
@@ -137,17 +115,10 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
             for (int pi : s) parents[i][k++] = pi;
         }
 
-        // Deterministic normalization: serial execution on the fastest VM.
-        // Independent of seed and of the random initial population, so fitness is comparable across runs/algorithms.
         refMakespan = Math.max(1e-9, total / mips[fastest]);
         refCost = Math.max(1e-12, price[fastest] * refMakespan);
     }
 
-    // =====================================================================
-    // Decoder / repair (Algorithm 1 lines 4 & 24, Algorithm 2 lines 4 & 28)
-    // =====================================================================
-
-    /** Priority-guided Kahn. Any priority vector yields a precedence-feasible order. */
     protected List<Task> decodeOrder(final int[] priority) {
         int[] inDeg = new int[n];
         List<List<Integer>> children = new ArrayList<>(n);
@@ -196,7 +167,7 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
         redecode(ind);
     }
 
-    /** Random VM assignment + random feasible topological order (Algorithm 1 L2 / Algorithm 2 L2). */
+    // Random VM assignment + random feasible topological order
     protected Individual randomIndividual() {
         Individual ind = new Individual(n);
         List<Integer> perm = new ArrayList<>(n);
@@ -211,11 +182,6 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
         return ind;
     }
 
-    // =====================================================================
-    // Evaluation
-    // =====================================================================
-
-    /** Repairs if needed, scores, and counts toward the evaluation budget. No-op for clean individuals. */
     protected void evaluate(Individual ind) {
         if (!ind.dirty && ind.rawMetrics != null) return;
         repair(ind);
@@ -229,19 +195,11 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
         return evalCount < EVAL_BUDGET;
     }
 
-    /**
-     * Hook for communication delay (Eq. 8, e.g. inter-datacenter transfer). Default: none.
-     * Override in a subclass (or edit here) once you decide how to model transfers.
-     */
+    // Hook for communication delay (Eq. 8, e.g. inter-datacenter transfer). Default: none.
     protected double commDelay(int parentTask, int childTask, int vmOfParent, int vmOfChild) {
         return 0.0;
     }
 
-    /**
-     * Strict per-VM queue in decoded order.
-     * Returns [makespan, cost, utilization]. Cost = sum_j price_j * RT_j with RT_j = last finish time on VM j
-     * (VM leased from t=0 until its last task completes; unused VMs cost nothing).
-     */
     protected double[] computeRawMetrics(Individual ind) {
         double[] vmFree = new double[m];
         double[] finish = new double[n];
@@ -276,10 +234,6 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
                 + W3_UTIL * (1.0 - mt[2]);
     }
 
-    // =====================================================================
-    // Shared move primitives
-    // =====================================================================
-
     protected boolean isDirectlyRelated(Task a, Task b) {
         int ia = taskIndexMap.get(a), ib = taskIndexMap.get(b);
         for (int p : parents[ib]) if (p == ia) return true;
@@ -287,13 +241,6 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
         return false;
     }
 
-    /**
-     * Order-swap move shared by GA (Algorithm 2 L23a) and CASSTO Brownian (Algorithm 1 L15a).
-     * Default (literal paper): swap two ADJACENT tasks in the execution order if not parent/child.
-     * With -DsameVmSwap=true: swap with the next task that runs on the SAME VM, because swapping
-     * tasks on different VMs leaves the schedule unchanged under a per-VM queue evaluator.
-     * Requires ind.order to be consistent with ind.priority (true after repair/redecode).
-     */
     protected void orderSwapMove(Individual ind) {
         if (n < 2) return;
         int pos = rnd.nextInt(n - 1);
@@ -323,9 +270,18 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
         ind.dirty = true;
     }
 
-    // =====================================================================
-    // Utilities
-    // =====================================================================
+    protected int differentVm(int currentVm) {
+        if (m < 2) return currentVm;
+        int nv = rnd.nextInt(m - 1);
+        return nv >= currentVm ? nv + 1 : nv;
+    }
+
+
+    protected void reassignToDifferentVm(Individual ind, int task) {
+        if (m < 2) return;
+        ind.vm[task] = differentVm(ind.vm[task]);
+        ind.dirty = true;
+    }
 
     protected Individual bestOf(List<Individual> pop) {
         Individual best = pop.get(0);

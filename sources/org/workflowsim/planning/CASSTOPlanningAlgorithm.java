@@ -3,37 +3,11 @@ package org.workflowsim.planning;
 import java.util.*;
 
 import org.cloudbus.cloudsim.Log;
-import org.workflowsim.CondorVM;
 import org.workflowsim.FileItem;
 import org.workflowsim.Task;
 import org.workflowsim.utils.Parameters;
 
 public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
-
-    // =========================================================================
-    // CASSTO Hyperparameters & Implementation Deviations from Paper
-    // =========================================================================
-    // 1. POP_SIZE = 30, MAX_ITER = 100, LEVY_LAMBDA = 1.5:
-    //    Directly from paper Section 5.2.
-    //
-    // 2. Beta Parameter (Omitted / Implicit):
-    //    Paper Eq. 5 specifies X^{t+1} = X^t + beta * N(0, 1) for continuous spaces.
-    //    In discrete DAG scheduling, beta is omitted; local Brownian search is
-    //    implemented via same-VM adjacent priority swaps and same-DC/adjacent-tier VM moves.
-    //
-    // 3. Alpha = 2.0 (Step Scale) & URGENT_BIAS = 0.7:
-    //    Paper Eq. 5 includes alpha * Levy(lambda) but omits a numerical value for alpha.
-    //    Alpha = 2.0 scales continuous Levy samples to a discrete number of task moves
-    //    (yielding avg step ~ 3.1). Paper Sec. 4.3 mentions urgent task prioritization
-    //    without an algorithmic mechanism; URGENT_BIAS = 0.7 biases 70% of Levy moves
-    //    to reassign critical-path tasks.
-    //
-    // 4. Iteration Schedule (pBrownian: 0.2 -> 0.8):
-    //    Paper Sec. 4.3 suggests switching based on diversity threshold delta = 0.25.
-    //    Under greedy acceptance on discrete chromosomes, diversity collapses early.
-    //    A linear exploration-to-exploitation ramp (0.2 -> 0.8) ensures global search
-    //    early and fine-grained refinement late.
-    // =========================================================================
     private static final int POP_SIZE = 30;
     private static final int MAX_ITER = 100;
     private static final double LEVY_LAMBDA = 1.5;
@@ -250,8 +224,11 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                 int tIdx = rnd.nextInt(n);
                 int curVm = ind.vm[tIdx];
                 List<Integer> neighbors = vmNeighbors[curVm];
-                ind.vm[tIdx] = neighbors.get(rnd.nextInt(neighbors.size()));
-                ind.dirty = true;
+                int newVm = neighbors.get(rnd.nextInt(neighbors.size()));
+                if (newVm != curVm) {
+                    ind.vm[tIdx] = newVm;
+                    ind.dirty = true;
+                }
             }
         }
     }
@@ -270,7 +247,7 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                 } else {
                     idx = rnd.nextInt(n);
                 }
-                ind.vm[idx] = rnd.nextInt(vmCount);
+                ind.vm[idx] = differentVm(ind.vm[idx]);
             }
             ind.dirty = true;
         } else {
@@ -294,7 +271,7 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                 int chosenVm = vmsWithMultiTasks.get(rnd.nextInt(vmsWithMultiTasks.size()));
                 List<Integer> vmTasks = tasksByVm[chosenVm];
                 Collections.shuffle(vmTasks, rnd);
-                int subsetSize = Math.min(moves, vmTasks.size());
+                int subsetSize = Math.min(Math.max(2, moves), vmTasks.size());
                 List<Integer> sub = vmTasks.subList(0, subsetSize);
 
                 List<Integer> pVals = new ArrayList<>();
@@ -307,7 +284,7 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                 }
             } else {
                 int idx = rnd.nextInt(n);
-                ind.vm[idx] = rnd.nextInt(vmCount);
+                ind.vm[idx] = differentVm(ind.vm[idx]);
             }
             ind.dirty = true;
         }
