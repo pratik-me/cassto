@@ -7,9 +7,11 @@ import org.workflowsim.Task;
 
 public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
     private static final int POP_SIZE = 30;
-    private static final double LEVY_LAMBDA = 1.5;
+    private static final double DIVERSITY_THRESHOLD = Double.parseDouble(System.getProperty("cassto.delta", "0.25"));
+    private static final double LEVY_LAMBDA = Double.parseDouble(System.getProperty("cassto.lambda", "1.5"));
     private static final double SIGMA_LEVY = computeSigma(LEVY_LAMBDA);
     private static final double INV_LEVY_LAMBDA = 1.0 / LEVY_LAMBDA;
+    private static final boolean USE_SCHEDULE = Boolean.parseBoolean(System.getProperty("cassto.useSchedule", "false"));
 
     private static final double P_BROWNIAN_MIN = 0.2;
     private static final double P_BROWNIAN_MAX = 0.8;
@@ -65,7 +67,7 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
         totalLevySteps = 0;
 
         Log.printLine("CASSTO planning: " + n + " tasks, " + m + " VMs, "
-                + urgentIdx.length + " urgent tasks, budget " + EVAL_BUDGET + " evals, seed " + SEED);
+                + urgentIdx.length + " urgent tasks, budget " + EVAL_BUDGET + " evals, delta " + DIVERSITY_THRESHOLD + ", lambda " + LEVY_LAMBDA + ", seed " + SEED);
 
         // -- 1. Initialization (Algorithm 1: Lines 1-6) --
         Individual[] population = new Individual[POP_SIZE];
@@ -85,14 +87,14 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
         int maxIter = 10 * EVAL_BUDGET;
         while (budgetLeft() && iter < maxIter) {
             int before = evalCount;
-            double pBrownian = P_BROWNIAN_MIN
-                    + (P_BROWNIAN_MAX - P_BROWNIAN_MIN) * Math.min(1.0, evalCount / (double) EVAL_BUDGET);
+            double d = populationDiversity(population);
+            boolean brownian = USE_SCHEDULE
+                    ? (rnd.nextDouble() < (P_BROWNIAN_MIN + (P_BROWNIAN_MAX - P_BROWNIAN_MIN) * Math.min(1.0, evalCount / (double) EVAL_BUDGET)))
+                    : (d < DIVERSITY_THRESHOLD);
 
             for (int i = 0; i < POP_SIZE; i++) {
                 if (!budgetLeft())
                     break;
-
-                boolean brownian = (rnd.nextDouble() < pBrownian);
                 Individual candidate = population[i].cloneIndividual();
 
                 if (brownian) {
@@ -186,7 +188,7 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                 double bWinRate = brownianCount > 0 ? 100.0 * brownianWins / brownianCount : 0.0;
                 double lWinRate = levyCount > 0 ? 100.0 * levyWins / levyCount : 0.0;
                 Log.printLine("CASSTO iter " + iter + " | best fit: " + String.format("%.4f", bestFitness)
-                        + " | pBrownian: " + String.format("%.2f", pBrownian)
+                        + " | D: " + String.format("%.4f", d) + " (delta: " + DIVERSITY_THRESHOLD + ", mode: " + (brownian ? "Brownian" : "Levy") + ")"
                         + " | Brownian moves: " + brownianCount + " (wins: " + brownianWins + ", neutral: "
                         + brownianNeutral + ", "
                         + String.format("%.1f%%", bWinRate) + ")"
@@ -204,7 +206,9 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
         double avgLevyStep = levyCount > 0 ? (double) totalLevySteps / levyCount : 0.0;
         double bWinRate = brownianCount > 0 ? 100.0 * brownianWins / brownianCount : 0.0;
         double lWinRate = levyCount > 0 ? 100.0 * levyWins / levyCount : 0.0;
-        Log.printLine("  -> Brownian moves (local/nearby VM): " + brownianCount + " (improvements: " + brownianWins
+        double finalD = populationDiversity(population);
+        Log.printLine("  -> Final diversity D: " + String.format("%.4f", finalD) + " (delta: " + DIVERSITY_THRESHOLD + ")\n"
+                + "  -> Brownian moves (local/nearby VM): " + brownianCount + " (improvements: " + brownianWins
                 + ", neutral: " + brownianNeutral
                 + ", winRate: " + String.format("%.1f%%", bWinRate) + ")"
                 + "\n  -> Levy moves (global/any VM):       " + levyCount + " (improvements: " + levyWins
@@ -394,6 +398,27 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
             a += g[i] / (x + i + 1);
         }
         return Math.sqrt(2 * Math.PI) * Math.pow(t, x + 0.5) * Math.exp(-t) * a;
+    }
+
+    // Population diversity: mean pairwise Hamming distance on VM assignments (Paper Eq. 5 / Sec 4.3)
+    private double populationDiversity(Individual[] pop) {
+        int popSize = pop.length;
+        double totalDist = 0.0;
+        int pairs = 0;
+
+        for (int i = 0; i < popSize; i++) {
+            for (int j = i + 1; j < popSize; j++) {
+                int diff = 0;
+                for (int t = 0; t < n; t++) {
+                    if (pop[i].vm[t] != pop[j].vm[t]) {
+                        diff++;
+                    }
+                }
+                totalDist += (double) diff / n;
+                pairs++;
+            }
+        }
+        return pairs > 0 ? totalDist / pairs : 0.0;
     }
 
     private Integer[] sortIndices(Individual[] pop) {
