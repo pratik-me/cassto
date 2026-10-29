@@ -3,306 +3,211 @@ package org.workflowsim.planning;
 import java.util.*;
 
 import org.cloudbus.cloudsim.Log;
-import org.workflowsim.CondorVM;
 import org.workflowsim.Task;
 
-public class GAPlanningAlgorithm extends BasePlanningAlgorithm {
+/**
+ * Genetic Algorithm for workflow scheduling (paper Algorithm 2), built on OrderAwarePlanningBase so it
+ * uses the same chromosome, decoder, evaluator and evaluation budget as CASSTO.
+ *
+ * Chromosome: VM per task + priority vector (decoded to a DAG-feasible order by Kahn).
+ *   L2      random feasible orders + VM assignments       -> randomIndividual()
+ *   L10     tournament selection                          -> tournament()
+ *   L13-15  precedence-preserving crossover               -> two-point on VM genes + OX on execution order
+ *   L21-23  mutation: (a) swap tasks in order / (b) reassign to a different VM
+ *   L28     repair DAG feasibility                        -> evaluate() -> repair() (Kahn)
+ *   L31-33  combine parents + offspring, keep top N       -> selectSurvivors()
+ *
+ * JVM properties for the parameter sweep (defaults = paper Sec. 5.1):
+ *   -Dga.pop=30  -Dga.pc=0.8  -Dga.pm=0.05  -Dga.tournament=3
+ *   -Dga.mutPerGene=true   true: pm applied per gene (n trials/offspring); false: literal L22, once per offspring
+ *   -Dga.dedupe=true       drop duplicate schedules before truncation (they otherwise fill the population)
+ */
+public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
 
-    // -- GA hyperparameters, from paper Sec. 5.1 --
-    private static final int POP_SIZE = 30;
-    private static final int MAX_GENERATIONS = 100;
-    private static final double CROSSOVER_PROB = 0.8;
-    private static final double MUTATION_PROB = 0.05;
-    private static final int TOURNAMENT_SIZE = 3;
-
-    // -- Fitness weights --
-    private static final double W1_MAKESPAN = 0.5;
-    private static final double W2_COST = 0.3;
-    private static final double W3_UTIL = 0.2;
-    private static final double PRICE_PER_MIPS_SECOND = 0.001;
-
-    private double refMakespan = 1.0;
-    private double refCost = 1.0;
-
-    private List<Task> topoOrder;
-    private static final long SEED = Long.getLong("seed", 42L);
-    private final Random rnd = new Random(SEED);
+    private static final int POP_SIZE = Integer.getInteger("ga.pop", 30);
+    private static final int TOURNAMENT_SIZE = Integer.getInteger("ga.tournament", 3);
+    private static final double CROSSOVER_PROB = dbl("ga.pc", 0.8);
+    private static final double MUTATION_PROB = dbl("ga.pm", 0.05);
+    private static final boolean MUT_PER_GENE = Boolean.parseBoolean(System.getProperty("ga.mutPerGene", "true"));
+    private static final boolean DEDUPE = Boolean.parseBoolean(System.getProperty("ga.dedupe", "true"));
 
     @Override
     public void run() {
-        topoOrder = topologicalSort();
-        int n = topoOrder.size();
-        int m = getVmList().size();
+        prepare();
+        Log.printLine("GA planning: " + n + " tasks, " + m + " VMs, pop " + POP_SIZE
+                + ", pc " + CROSSOVER_PROB + ", pm " + MUTATION_PROB
+                + (MUT_PER_GENE ? " (per gene)" : " (per offspring)")
+                + ", budget " + EVAL_BUDGET + " evals, seed " + SEED);
 
-        Log.printLine("GA planning: " + n + " tasks, " + m + " VMs.");
-
-        // -- 1. Initialization + reference normalization baselines (Eq. 4) --
-        int[][] population = new int[POP_SIZE][n];
-        double[] fitness = new double[POP_SIZE];
-        double sumMakespan = 0;
-        double sumCost = 0;
-        double[][] initMetrics = new double[POP_SIZE][3];
+        // -- Initialization (Algorithm 2 L1-7) --
+        List<Individual> pop = new ArrayList<>(POP_SIZE);
         for (int i = 0; i < POP_SIZE; i++) {
-            for (int t = 0; t < n; t++) {
-                population[i][t] = rnd.nextInt(m);
-            }
-            repair(population[i], m); // Algorithm Line 4: repair DAG feasibility
-            initMetrics[i] = computeRawMetrics(population[i]);
-            sumMakespan += initMetrics[i][0];
-            sumCost += initMetrics[i][1];
+            Individual ind = randomIndividual();
+            evaluate(ind);
+            pop.add(ind);
         }
-        refMakespan = sumMakespan / POP_SIZE;
-        refCost = sumCost / POP_SIZE;
+        Individual best = bestOf(pop).cloneIndividual();
 
-        for (int i = 0; i < POP_SIZE; i++) {
-            fitness[i] = calcFitness(initMetrics[i]);
-        }
+        // -- Generation loop (L8-37), stops on evaluation budget --
+        int gen = 0;
+        int genCap = 10 * EVAL_BUDGET;     // safety net if pc and pm are ~0 and no evaluations happen
+        while (budgetLeft() && gen < genCap) {
+            List<Individual> kids = breed(pop);
 
-        int bestIdx = bestOf(fitness);
-        int[] best = population[bestIdx].clone();
-        double bestFitness = fitness[bestIdx];
-
-        // ---- 2. Generation loop ----
-        for (int gen = 0; gen < MAX_GENERATIONS; gen++) {
-            int[][] offspring = new int[POP_SIZE][];
-            for (int i = 0; i < POP_SIZE; i += 2) {
-                int[] parentA = tournamentSelect(population, fitness);
-                int[] parentB = tournamentSelect(population, fitness);
-
-                int[] childA;
-                int[] childB;
-                if (rnd.nextDouble() < CROSSOVER_PROB) {
-                    int[][] children = crossover(parentA, parentB);
-                    childA = children[0];
-                    childB = children[1];
-                } else {
-                    childA = parentA.clone();
-                    childB = parentB.clone();
-                }
-
-                mutate(childA, m);
-                mutate(childB, m);
-
-                offspring[i] = childA;
-                if (i + 1 < POP_SIZE) {
-                    offspring[i + 1] = childB;
-                }
+            // L26-30: repair + evaluate. Unchanged clones are not re-evaluated and cost no budget.
+            List<Individual> evaluated = new ArrayList<>(kids.size());
+            for (Individual k : kids) {
+                if (k.dirty && !budgetLeft()) continue;   // budget exhausted: discard unevaluated offspring
+                evaluate(k);
+                evaluated.add(k);
             }
 
-            // Algorithm Lines 26-30: Repair and Evaluation for each offspring
-            double[] offspringFitness = new double[POP_SIZE];
-            for (int i = 0; i < POP_SIZE; i++) {
-                repair(offspring[i], m); // repair before evaluating
-                offspringFitness[i] = evaluate(offspring[i]);
-            }
+            pop = selectSurvivors(pop, evaluated);       // L31-33
 
-            // -- 3. Elitism: combine parents + offspring --
-            int[][] combined = new int[2 * POP_SIZE][];
-            double[] combinedFitness = new double[2 * POP_SIZE];
-            for (int i = 0; i < POP_SIZE; i++) {
-                combined[i] = population[i];
-                combinedFitness[i] = fitness[i];
-                combined[POP_SIZE + i] = offspring[i];
-                combinedFitness[POP_SIZE + i] = offspringFitness[i];
-            }
+            Individual top = pop.get(0);                 // L34-36
+            if (top.fitness < best.fitness) best = top.cloneIndividual();
 
-            Integer[] order = sortIndicesByCost(combinedFitness);
-            for (int i = 0; i < POP_SIZE; i++) {
-                population[i] = combined[order[i]];
-                fitness[i] = combinedFitness[order[i]];
-            }
-
-            if (fitness[0] < bestFitness) {
-                bestFitness = fitness[0];
-                best = population[0].clone();
-            }
-
-            if (gen % 10 == 0) {
-                Log.printLine("GA generation " + gen + " best fitness = " + bestFitness);
-            }
+            if (gen % 10 == 0) logProgress("GA", gen, best);
+            gen++;
         }
 
-        // -- 4. Apply the best mapping found --
-        for (int t = 0; t < n; t++) {
-            Task task = topoOrder.get(t);
-            CondorVM vm = (CondorVM) getVmList().get(best[t]);
-            task.setVmId(vm.getId());
-        }
-        Log.printLine("GA planning finished, best fitness = " + bestFitness);
+        applySolution(best);
+        logFinal("GA", best, gen);
     }
 
-    // DAG + fitness
-    private List<Task> topologicalSort() {
-        List<Task> order = new ArrayList<>();
-        Set<Task> visited = new HashSet<>();
-        for (Object o : getTaskList()) {
-            visitTask((Task) o, visited, order);
-        }
-        return order;
-    }
+    // =====================================================================
+    // Variation
+    // =====================================================================
 
-    private void visitTask(Task t, Set<Task> visited, List<Task> order) {
-        if (visited.contains(t)) {
-            return;
-        }
-        visited.add(t);
-        for (Object p : t.getParentList()) {
-            visitTask((Task) p, visited, order);
-        }
-        order.add(t);
-    }
+    private List<Individual> breed(List<Individual> pop) {
+        List<Individual> kids = new ArrayList<>(POP_SIZE);
+        while (kids.size() < POP_SIZE) {
+            Individual a = tournament(pop);
+            Individual b = tournament(pop);
 
-    private double[] computeRawMetrics(int[] mapping) {
-        int m = getVmList().size();
-        double[] vmFreeAt = new double[m];
-        Map<Task, Double> finishTime = new HashMap<>();
-        double totalCost = 0;
-        double totalBusy = 0;
-
-        for (int idx = 0; idx < topoOrder.size(); idx++) {
-            Task task = topoOrder.get(idx);
-            CondorVM vm = (CondorVM) getVmList().get(mapping[idx]);
-            double mips = vm.getMips();
-
-            double readyTime = vmFreeAt[mapping[idx]];
-            for (Object p : task.getParentList()) {
-                Task parent = (Task) p;
-                readyTime = Math.max(readyTime, finishTime.get(parent));
+            Individual c1, c2;
+            if (rnd.nextDouble() < CROSSOVER_PROB) {
+                Individual[] c = crossover(a, b);
+                c1 = c[0];
+                c2 = c[1];
+            } else {
+                c1 = a.cloneIndividual();                // L17: offspring = parents, stays clean (no re-eval)
+                c2 = b.cloneIndividual();
             }
+            mutate(c1);
+            mutate(c2);
 
-            double execTime = task.getCloudletLength() / mips;
-            double finish = readyTime + execTime;
-
-            finishTime.put(task, finish);
-            vmFreeAt[mapping[idx]] = finish;
-
-            totalCost += execTime * PRICE_PER_MIPS_SECOND * mips;
-            totalBusy += execTime;
+            kids.add(c1);
+            if (kids.size() < POP_SIZE) kids.add(c2);
         }
-
-        double makespan = 0;
-        for (double t : vmFreeAt) {
-            makespan = Math.max(makespan, t);
-        }
-
-        double totalAvailable = makespan * m;
-        double resourceUtil = totalAvailable > 0 ? totalBusy / totalAvailable : 0;
-
-        return new double[] { makespan, totalCost, resourceUtil };
+        return kids;
     }
 
-    private double calcFitness(double[] metrics) {
-        double normMakespan = refMakespan > 0 ? metrics[0] / refMakespan : metrics[0];
-        double normCost = refCost > 0 ? metrics[1] / refCost : metrics[1];
-        double normUtil = 1.0 - metrics[2];
-
-        return W1_MAKESPAN * normMakespan + W2_COST * normCost + W3_UTIL * normUtil;
-    }
-
-    private double evaluate(int[] mapping) {
-        return calcFitness(computeRawMetrics(mapping));
-    }
-
-    // GA operators (Algorithm 2)
-    /** Tournament selection, size TOURNAMENT_SIZE. */
-    private int[] tournamentSelect(int[][] population, double[] fitness) {
-        int bestIdx = -1;
-        double bestFit = Double.MAX_VALUE;
+    private Individual tournament(List<Individual> pop) {
+        Individual best = null;
         for (int k = 0; k < TOURNAMENT_SIZE; k++) {
-            int idx = rnd.nextInt(population.length);
-            if (fitness[idx] < bestFit) {
-                bestFit = fitness[idx];
-                bestIdx = idx;
-            }
-        }
-        return population[bestIdx];
-    }
-
-    // Two-point crossover over the VM-assignment chromosome.
-    private int[][] crossover(int[] parentA, int[] parentB) {
-        int n = parentA.length;
-        int[] childA = parentA.clone();
-        int[] childB = parentB.clone();
-
-        if (n < 2) {
-            return new int[][] { childA, childB };
-        }
-
-        int p1 = rnd.nextInt(n);
-        int p2 = rnd.nextInt(n);
-        int lo = Math.min(p1, p2);
-        int hi = Math.max(p1, p2);
-
-        for (int t = lo; t <= hi; t++) {
-            int tmp = childA[t];
-            childA[t] = childB[t];
-            childB[t] = tmp;
-        }
-        return new int[][] { childA, childB };
-    }
-
-    // Mutation (Algorithm 2, Lines 21-24)
-    // For each gene, with probability p_m applies one of:
-    //   (a) swap two adjacent tasks in valid topological order (DAG-feasible)
-    //   (b) reassign task to a different VM
-    private void mutate(int[] individual, int vmCount) {
-        int n = individual.length;
-        for (int t = 0; t < n; t++) {
-            if (rnd.nextDouble() < MUTATION_PROB) {
-                if (rnd.nextBoolean() && n > 1) {
-                    // Option (a): swap with adjacent task if DAG-safe
-                    int t2 = (t + 1 < n) ? t + 1 : t - 1;
-                    Task task1 = topoOrder.get(t);
-                    Task task2 = topoOrder.get(t2);
-                    if (!isDirectlyRelated(task1, task2)) {
-                        int tmp = individual[t];
-                        individual[t] = individual[t2];
-                        individual[t2] = tmp;
-                    }
-                } else {
-                    // Option (b): reassign to a different VM
-                    individual[t] = rnd.nextInt(vmCount);
-                }
-            }
-        }
-    }
-
-    // Repair schedule (Algorithm 2 Lines 4 & 28): clamp VM indices to valid range.
-    private void repair(int[] individual, int vmCount) {
-        for (int t = 0; t < individual.length; t++) {
-            if (individual[t] < 0 || individual[t] >= vmCount) {
-                individual[t] = rnd.nextInt(vmCount);
-            }
-        }
-    }
-
-    // Returns true if a and b are directly related (parent-child) in the DAG.
-    private boolean isDirectlyRelated(Task a, Task b) {
-        for (Object p : b.getParentList()) {
-            if (p == a) return true;
-        }
-        for (Object p : a.getParentList()) {
-            if (p == b) return true;
-        }
-        return false;
-    }
-
-    private int bestOf(double[] fitness) {
-        int best = 0;
-        for (int i = 1; i < fitness.length; i++) {
-            if (fitness[i] < fitness[best]) {
-                best = i;
-            }
+            Individual c = pop.get(rnd.nextInt(pop.size()));
+            if (best == null || c.fitness < best.fitness) best = c;
         }
         return best;
     }
 
-    private Integer[] sortIndicesByCost(double[] fitness) {
-        Integer[] idx = new Integer[fitness.length];
-        for (int i = 0; i < idx.length; i++) {
-            idx[i] = i;
+    /** Two-point crossover on VM genes + order crossover (OX) on the execution order. */
+    private Individual[] crossover(Individual a, Individual b) {
+        Individual c1 = a.cloneIndividual();
+        Individual c2 = b.cloneIndividual();
+
+        // VM genes (indexed by task): swap a segment
+        int p1 = rnd.nextInt(n), p2 = rnd.nextInt(n);
+        int lo = Math.min(p1, p2), hi = Math.max(p1, p2);
+        for (int t = lo; t <= hi; t++) {
+            int tmp = c1.vm[t];
+            c1.vm[t] = c2.vm[t];
+            c2.vm[t] = tmp;
         }
-        Arrays.sort(idx, Comparator.comparingDouble(i -> fitness[i]));
-        return idx;
+
+        // Execution order (indexed by position): OX with its own cut points
+        int q1 = rnd.nextInt(n), q2 = rnd.nextInt(n);
+        int qlo = Math.min(q1, q2), qhi = Math.max(q1, q2);
+        c1.priority = oxPriority(a, b, qlo, qhi);
+        c2.priority = oxPriority(b, a, qlo, qhi);
+
+        // OX can violate precedence; Kahn repairs it. Re-decode now so order is consistent for mutation.
+        redecode(c1);
+        redecode(c2);
+        c1.dirty = true;
+        c2.dirty = true;
+        return new Individual[] { c1, c2 };
+    }
+
+    /** OX: keep first parent's segment [lo..hi] by position, fill the rest in the second parent's order. */
+    private int[] oxPriority(Individual first, Individual second, int lo, int hi) {
+        int[] child = new int[n];                  // child[position] = task index
+        boolean[] used = new boolean[n];
+        for (int pos = lo; pos <= hi; pos++) {
+            int ti = taskIndexMap.get(first.order.get(pos));
+            child[pos] = ti;
+            used[ti] = true;
+        }
+        int fill = 0;
+        for (Task t : second.order) {
+            int ti = taskIndexMap.get(t);
+            if (used[ti]) continue;
+            while (fill >= lo && fill <= hi) fill++;
+            child[fill++] = ti;
+        }
+        int[] prio = new int[n];
+        for (int pos = 0; pos < n; pos++) prio[child[pos]] = pos;
+        return prio;
+    }
+
+    /** Algorithm 2 L21-23: (a) swap in execution order, or (b) reassign a task to a DIFFERENT VM. */
+    private void mutate(Individual ind) {
+        int trials = MUT_PER_GENE ? n : 1;
+        for (int g = 0; g < trials; g++) {
+            if (rnd.nextDouble() >= MUTATION_PROB) continue;
+            if (rnd.nextBoolean() && n > 1) {
+                orderSwapMove(ind);                // shared with CASSTO; honours -DsameVmSwap
+            } else {
+                reassignToDifferentVm(ind, rnd.nextInt(n));
+            }
+        }
+    }
+
+    private void reassignToDifferentVm(Individual ind, int task) {
+        if (m < 2) return;
+        int nv = rnd.nextInt(m - 1);
+        ind.vm[task] = nv >= ind.vm[task] ? nv + 1 : nv;
+        ind.dirty = true;
+    }
+
+    // =====================================================================
+    // Replacement (L31-33): (mu + lambda) truncation, stable so ties favour parents
+    // =====================================================================
+
+    private List<Individual> selectSurvivors(List<Individual> parents, List<Individual> kids) {
+        List<Individual> all = new ArrayList<>(parents.size() + kids.size());
+        all.addAll(parents);
+        all.addAll(kids);
+        all.sort(Comparator.comparingDouble((Individual x) -> x.fitness));   // List.sort is stable
+
+        if (!DEDUPE) {
+            return new ArrayList<>(all.subList(0, Math.min(POP_SIZE, all.size())));
+        }
+
+        List<Individual> out = new ArrayList<>(POP_SIZE);
+        List<Individual> dupes = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (Individual x : all) {
+            if (out.size() == POP_SIZE) break;
+            if (seen.add(signature(x))) out.add(x);
+            else dupes.add(x);
+        }
+        for (Individual x : dupes) {               // only if there were too few distinct schedules
+            if (out.size() == POP_SIZE) break;
+            out.add(x);
+        }
+        out.sort(Comparator.comparingDouble((Individual x) -> x.fitness));
+        return out;
     }
 }
