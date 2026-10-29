@@ -57,8 +57,6 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
     private double[] mips; // VM speed
     private double[] price; // VM price per second
     private int[][] parents; // parents[i] = indices of parent tasks
-    private final Map<String, double[]> cache = new HashMap<>(); // clear in prepare()
-    protected int cacheHits;
     private double refMakespan = 1.0;
     private double refCost = 1.0;
 
@@ -119,8 +117,6 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
     protected void prepare() {
         rnd = new Random(SEED);
         evalCount = 0;
-        cache.clear();
-        cacheHits = 0;
 
         taskList = new ArrayList<>();
         taskIndexMap = new HashMap<>();
@@ -246,20 +242,12 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
         if (!ind.dirty && ind.rawMetrics != null)
             return false;
         repair(ind);
-        String key = signature(ind);
-        double[] mt = cache.get(key);
-        boolean fresh = (mt == null);
-        if (fresh) {
-            mt = computeRawMetrics(ind);
-            cache.put(key, mt);
-        } else {
-            cacheHits++;
-        }
+        double[] mt = computeRawMetrics(ind);
         evalCount++;
         ind.rawMetrics = mt.clone();
         ind.fitness = calcFitness(mt);
         ind.dirty = false;
-        return fresh;
+        return true;
     }
 
     protected boolean budgetLeft() {
@@ -422,8 +410,7 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
     }
 
     protected void logFinal(String algo, Individual best, int steps) {
-        Log.printLine(algo + " planning finished after " + steps + " steps, " + evalCount + " evaluations (cache hits: "
-                + cacheHits + ")"
+        Log.printLine(algo + " planning finished after " + steps + " steps, " + evalCount + " evaluations "
                 + "\n  -> estimated makespan: " + String.format("%.3f", best.rawMetrics[0])
                 + " | estimated cost: " + String.format("%.4f", best.rawMetrics[1])
                 + " | utilization: " + String.format("%.3f", best.rawMetrics[2])

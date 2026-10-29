@@ -13,15 +13,12 @@ import org.workflowsim.WorkflowEngine;
 import org.workflowsim.WorkflowPlanner;
 import org.workflowsim.utils.Parameters;
 
-/**
- * Driver for Genetic Algorithm planning algorithm using shared SimSetup.
- */
 public class GA_1 {
 
     public static void main(String[] args) {
         try {
             int vmNum = 20;
-            String daxPath = "config/dax/Montage_50.xml";
+            String daxPath = "config/dax/Montage_100.xml";
 
             if (!SimSetup.setupParameters(vmNum, daxPath, Parameters.PlanningAlgorithm.GA)) {
                 return;

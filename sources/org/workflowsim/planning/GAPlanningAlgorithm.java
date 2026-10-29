@@ -5,23 +5,6 @@ import java.util.*;
 import org.cloudbus.cloudsim.Log;
 import org.workflowsim.Task;
 
-/**
- * Genetic Algorithm for workflow scheduling (paper Algorithm 2), built on OrderAwarePlanningBase so it
- * uses the same chromosome, decoder, evaluator and evaluation budget as CASSTO.
- *
- * Chromosome: VM per task + priority vector (decoded to a DAG-feasible order by Kahn).
- *   L2      random feasible orders + VM assignments       -> randomIndividual()
- *   L10     tournament selection                          -> tournament()
- *   L13-15  precedence-preserving crossover               -> two-point on VM genes + OX on execution order
- *   L21-23  mutation: (a) swap tasks in order / (b) reassign to a different VM
- *   L28     repair DAG feasibility                        -> evaluate() -> repair() (Kahn)
- *   L31-33  combine parents + offspring, keep top N       -> selectSurvivors()
- *
- * JVM properties for the parameter sweep (defaults = paper Sec. 5.1):
- *   -Dga.pop=30  -Dga.pc=0.8  -Dga.pm=0.05  -Dga.tournament=3
- *   -Dga.mutPerGene=false  false (default): literal paper L22, once per offspring (5%); true: pm applied per gene
- *   -Dga.dedupe=true       drop duplicate schedules before truncation (they otherwise fill the population)
- */
 public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
 
     private static final int POP_SIZE = Integer.getInteger("ga.pop", 30);
@@ -54,7 +37,7 @@ public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
         while (budgetLeft() && gen < genCap) {
             List<Individual> kids = breed(pop);
 
-            // L26-30: repair + evaluate. Unchanged clones are not re-evaluated and cost no budget.
+            // L26-30: repair + evaluate.
             List<Individual> evaluated = new ArrayList<>(kids.size());
             for (Individual k : kids) {
                 if (k.dirty && !budgetLeft()) continue;   // budget exhausted: discard unevaluated offspring
@@ -91,7 +74,7 @@ public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
                 c1 = c[0];
                 c2 = c[1];
             } else {
-                c1 = a.cloneIndividual();             // L17
+                c1 = a.cloneIndividual();         // L17
                 c2 = b.cloneIndividual();
             }
             mutate(c1);
@@ -142,7 +125,7 @@ public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
 
     /** OX: keep first parent's segment [lo..hi] by position, fill the rest in the second parent's order. */
     private int[] oxPriority(Individual first, Individual second, int lo, int hi) {
-        int[] child = new int[n];                  // child[position] = task index
+        int[] child = new int[n];
         boolean[] used = new boolean[n];
         for (int pos = lo; pos <= hi; pos++) {
             int ti = taskIndexMap.get(first.order.get(pos));
@@ -167,17 +150,12 @@ public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
         for (int g = 0; g < trials; g++) {
             if (rnd.nextDouble() >= MUTATION_PROB) continue;
             if (rnd.nextBoolean() && n > 1) {
-                orderSwapMove(ind);                // shared with CASSTO; honours -DsameVmSwap
+                orderSwapMove(ind);              // shared with CASSTO; -DsameVmSwap
             } else {
                 reassignToDifferentVm(ind, rnd.nextInt(n));
             }
         }
     }
-
-
-    // =====================================================================
-    // Replacement (L31-33): (mu + lambda) truncation, stable so ties favour parents
-    // =====================================================================
 
     private List<Individual> selectSurvivors(List<Individual> parents, List<Individual> kids) {
         List<Individual> all = new ArrayList<>(parents.size() + kids.size());
@@ -197,7 +175,7 @@ public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
             if (seen.add(signature(x))) out.add(x);
             else dupes.add(x);
         }
-        for (Individual x : dupes) {     // only if there were too few distinct schedules
+        for (Individual x : dupes) {   // only if there were too few distinct schedules
             if (out.size() == POP_SIZE) break;
             out.add(x);
         }

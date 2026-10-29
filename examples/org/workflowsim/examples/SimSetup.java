@@ -31,7 +31,6 @@ import org.workflowsim.utils.OverheadParameters;
 import org.workflowsim.utils.Parameters;
 import org.workflowsim.utils.ReplicaCatalog;
 
-
 public class SimSetup {
     public static boolean setupParameters(int vmNum, String daxPath, Parameters.PlanningAlgorithm pln_method) {
         File daxFile = new File(daxPath);
@@ -77,9 +76,6 @@ public class SimSetup {
         return list;
     }
 
-    /**
-     * Creates a standard WorkflowDatacenter with consistent ClusterStorage transfer rates and inter-DC bandwidths.
-     */
     public static WorkflowDatacenter createDatacenter(String name, int vmCapacity) throws Exception {
         List<Host> hostList = new ArrayList<>();
         List<Pe> peList = new ArrayList<>();
@@ -128,9 +124,6 @@ public class SimSetup {
                 name, characteristics, new VmAllocationPolicySimple(hostList), storageList, 0);
     }
 
-    /**
-     * Standardized result printing across all algorithms.
-     */
     public static void printResults(String title, List<Cloudlet> list, List<CondorVM> vmList, Map<Integer, String> dcNames, Double plannerEstimatedMakespan) {
         Log.printLine("========== " + title + " ==========");
         double makespan = 0;

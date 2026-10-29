@@ -32,7 +32,6 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
     private int levyWins = 0;
     private int brownianNeutral = 0;
     private int levyNeutral = 0;
-    private int cacheAdopted = 0;
     private int dedupeCount = 0;
     private long totalLevySteps = 0;
 
@@ -62,7 +61,6 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
         levyWins = 0;
         brownianNeutral = 0;
         levyNeutral = 0;
-        cacheAdopted = 0;
         dedupeCount = 0;
         totalLevySteps = 0;
 
@@ -104,7 +102,7 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                 }
 
                 boolean attempted = candidate.dirty;
-                boolean fresh = evaluate(candidate);
+                evaluate(candidate);
                 boolean wasRegen = isRegenerated[i];
                 isRegenerated[i] = false;
 
@@ -120,9 +118,6 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                             brownianWins++;
                         else
                             levyWins++;
-                    }
-                    if (!fresh) {
-                        cacheAdopted++;
                     }
                     population[i] = candidate;
                 } else if (attempted && !wasRegen && Math.abs(candidate.fitness - population[i].fitness) <= 1e-9) {
@@ -197,7 +192,7 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                         + String.format("%.1f%%", bWinRate) + ")"
                         + " | Levy moves: " + levyCount + " (wins: " + levyWins + ", neutral: " + levyNeutral + ", "
                         + String.format("%.1f%%", lWinRate) + ", avgStep: " + String.format("%.2f", avgLevyStep) + ")"
-                        + " | cacheAdopted: " + cacheAdopted);
+                       );
             }
             iter++;
         }
@@ -216,7 +211,6 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                 + ", neutral: " + levyNeutral
                 + ", winRate: " + String.format("%.1f%%", lWinRate) + ", avgStep: " + String.format("%.2f", avgLevyStep)
                 + ")"
-                + "\n  -> Cache hits: " + cacheHits + ", Cache adoptions: " + cacheAdopted
                 + "\n  -> Deduplications: " + dedupeCount);
         logFinal("CASSTO", best, iter);
     }

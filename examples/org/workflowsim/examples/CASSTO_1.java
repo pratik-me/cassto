@@ -13,15 +13,12 @@ import org.workflowsim.WorkflowEngine;
 import org.workflowsim.WorkflowPlanner;
 import org.workflowsim.utils.Parameters;
 
-/**
- * Driver for CASSTO planning algorithm using shared SimSetup.
- */
 public class CASSTO_1 {
 
     public static void main(String[] args) {
         try {
             int vmNum = 20; // matches paper's Table 1: 20 heterogeneous VMs
-            String daxPath = "config/dax/Montage_50.xml";
+            String daxPath = "config/dax/Montage_100.xml";
 
             if (!SimSetup.setupParameters(vmNum, daxPath, Parameters.PlanningAlgorithm.CASSTO)) {
                 return;
