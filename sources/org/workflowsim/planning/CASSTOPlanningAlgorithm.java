@@ -12,20 +12,22 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
     private static final double SIGMA_LEVY = computeSigma(LEVY_LAMBDA);
     private static final double INV_LEVY_LAMBDA = 1.0 / LEVY_LAMBDA;
     private static final boolean USE_SCHEDULE = Boolean.parseBoolean(System.getProperty("cassto.useSchedule", "false"));
+    private static final boolean INVERT_DIVERSITY = Boolean.parseBoolean(System.getProperty("cassto.invertDiversity", "false"));
 
     private static final double P_BROWNIAN_MIN = 0.2;
     private static final double P_BROWNIAN_MAX = 0.8;
 
     private static final double LEVY_ALPHA = 2.0;
-    private static final double URGENT_BIAS = 0.7;
 
     private static final boolean DEDUPE = Boolean.parseBoolean(System.getProperty("cassto.dedupe", "true"));
     private static final int STALL_LIMIT = Integer.getInteger("cassto.stallLimit", 200);
+    private static final int REGEN_COUNT = Integer.getInteger("cassto.regenCount", 0);
 
     public static double bestEstimatedMakespan = 0.0;
 
     private Map<Task, Boolean> urgent;
     private int[] urgentIdx;
+    private int[] normalIdx;
     private List<Integer>[] vmNeighbors;
 
     private int brownianCount = 0;
@@ -47,14 +49,21 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
         urgent = computeUrgency(baseTopoOrder);
 
         List<Integer> u = new ArrayList<>();
+        List<Integer> norm = new ArrayList<>();
         for (int i = 0; i < n; i++) {
             if (urgent.get(taskList.get(i))) {
                 u.add(i);
+            } else {
+                norm.add(i);
             }
         }
         urgentIdx = new int[u.size()];
         for (int i = 0; i < urgentIdx.length; i++) {
             urgentIdx[i] = u.get(i);
+        }
+        normalIdx = new int[norm.size()];
+        for (int i = 0; i < normalIdx.length; i++) {
+            normalIdx[i] = norm.get(i);
         }
 
         brownianCount = 0;
@@ -67,7 +76,7 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
         totalLevySteps = 0;
 
         Log.printLine("CASSTO planning: " + n + " tasks, " + m + " VMs, "
-                + urgentIdx.length + " urgent tasks, budget " + EVAL_BUDGET + " evals, delta " + DIVERSITY_THRESHOLD + ", lambda " + LEVY_LAMBDA + ", seed " + SEED);
+                + urgentIdx.length + " urgent tasks, " + normalIdx.length + " normal tasks, budget " + EVAL_BUDGET + " evals, delta " + DIVERSITY_THRESHOLD + ", lambda " + LEVY_LAMBDA + (INVERT_DIVERSITY ? " (inverted: D < delta -> Brownian)" : " (standard: D < delta -> Levy)") + ", seed " + SEED);
 
         // -- 1. Initialization (Algorithm 1: Lines 1-6) --
         Individual[] population = new Individual[POP_SIZE];
@@ -90,7 +99,7 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
             double d = populationDiversity(population);
             boolean brownian = USE_SCHEDULE
                     ? (rnd.nextDouble() < (P_BROWNIAN_MIN + (P_BROWNIAN_MAX - P_BROWNIAN_MIN) * Math.min(1.0, evalCount / (double) EVAL_BUDGET)))
-                    : (d < DIVERSITY_THRESHOLD);
+                    : (INVERT_DIVERSITY ? (d < DIVERSITY_THRESHOLD) : (d >= DIVERSITY_THRESHOLD));
 
             for (int i = 0; i < POP_SIZE; i++) {
                 if (!budgetLeft())
@@ -134,7 +143,7 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                 }
             }
 
-            // Sort population for diversity injection and deduplication
+            // Sort population for deduplication (best to worst to preserve superior copies)
             Integer[] order = sortIndices(population);
 
             // Deduplicate population
@@ -157,22 +166,22 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                 }
             }
 
-            // Diversity injection: regenerate worst individuals randomly
-            int rCount = 2;
-            for (int r = 0; r < rCount; r++) {
-                if (!budgetLeft())
-                    break;
-                int worstIdx = order[POP_SIZE - 1 - r];
-                if (isRegenerated[worstIdx])
-                    continue;
-                population[worstIdx] = randomIndividual();
-                evaluate(population[worstIdx]);
+            // Diversity injection: optionally regenerate worst individuals randomly if configured
+            if (REGEN_COUNT > 0) {
+                Integer[] freshOrder = sortIndices(population);
+                for (int r = 0; r < REGEN_COUNT; r++) {
+                    if (!budgetLeft())
+                        break;
+                    int worstIdx = freshOrder[POP_SIZE - 1 - r];
+                    population[worstIdx] = randomIndividual();
+                    evaluate(population[worstIdx]);
 
-                if (population[worstIdx].fitness < bestFitness) {
-                    bestFitness = population[worstIdx].fitness;
-                    best = population[worstIdx].cloneIndividual();
+                    if (population[worstIdx].fitness < bestFitness) {
+                        bestFitness = population[worstIdx].fitness;
+                        best = population[worstIdx].cloneIndividual();
+                    }
+                    isRegenerated[worstIdx] = true;
                 }
-                isRegenerated[worstIdx] = true;
             }
 
             sinceFresh = (evalCount == before) ? sinceFresh + 1 : 0;
@@ -245,9 +254,9 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                 // (a) Order move: orderSwapMove(ind)
                 orderSwapMove(ind);
             } else {
-                // (b) Nearby VM move: same datacenter and same or adjacent speed tier (true
+                // (b) Nearby VM move on normal tasks: same datacenter and same or adjacent speed tier (true
                 // refinement)
-                int tIdx = rnd.nextInt(n);
+                int tIdx = normalIdx.length > 0 ? normalIdx[rnd.nextInt(normalIdx.length)] : rnd.nextInt(n);
                 int curVm = ind.vm[tIdx];
                 List<Integer> neighbors = vmNeighbors[curVm];
                 int newVm = neighbors.get(rnd.nextInt(neighbors.size()));
@@ -265,14 +274,9 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
         totalLevySteps += moves;
 
         if (rnd.nextBoolean()) {
-            // (a) Global VM jump: explore any VM across datacenters
+            // (a) Global VM jump on urgent tasks: explore any VM across datacenters
             for (int k = 0; k < moves; k++) {
-                int idx;
-                if (urgentIdx.length > 0 && rnd.nextDouble() < URGENT_BIAS) {
-                    idx = urgentIdx[rnd.nextInt(urgentIdx.length)];
-                } else {
-                    idx = rnd.nextInt(n);
-                }
+                int idx = urgentIdx.length > 0 ? urgentIdx[rnd.nextInt(urgentIdx.length)] : rnd.nextInt(n);
                 ind.vm[idx] = differentVm(ind.vm[idx]);
             }
             ind.dirty = true;
@@ -309,7 +313,7 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
                     ind.priority[sub.get(i)] = pVals.get(i);
                 }
             } else {
-                int idx = rnd.nextInt(n);
+                int idx = urgentIdx.length > 0 ? urgentIdx[rnd.nextInt(urgentIdx.length)] : rnd.nextInt(n);
                 ind.vm[idx] = differentVm(ind.vm[idx]);
             }
             ind.dirty = true;
@@ -357,13 +361,15 @@ public class CASSTOPlanningAlgorithm extends OrderAwarePlanningBase {
             criticalPathLength = Math.max(criticalPathLength, totalPath);
         }
 
-        // 4. Mark tasks as urgent if their path is within 5% of the critical path
-        // length
+        // 4. Mark tasks as urgent if on strict critical path or approaching deadline (Paper Eq. 6)
+        double deadlineFactor = Double.parseDouble(System.getProperty("cassto.deadlineFactor", "0"));
+        double eps = 1e-4;
         Map<Task, Boolean> urgencyMap = new HashMap<>();
-        double threshold = (1.0 - 0.05) * criticalPathLength;
         for (Task t : order) {
             double totalPath = tl.get(t) + bl.get(t);
-            urgencyMap.put(t, totalPath >= threshold);
+            boolean onCriticalPath = (totalPath >= criticalPathLength - eps);
+            boolean nearDeadline = (deadlineFactor > 0) && (totalPath >= deadlineFactor * criticalPathLength * 0.95);
+            urgencyMap.put(t, onCriticalPath || nearDeadline);
         }
         return urgencyMap;
     }
