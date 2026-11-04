@@ -11,18 +11,43 @@ import org.workflowsim.utils.Parameters;
 public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
 
     //-- ICA hyperparameters --
-    private static final int NUM_COUNTRIES = 30; 
+    private static final int NUM_COUNTRIES = Integer.getInteger("hica.pop", 30); 
     private static final int NUM_IMPERIALISTS = 6;        // ~20% of countries become imperialists
     private static final int MAX_ITER = 100;
     private static final double ASSIMILATION_PROB = 0.6;   // chance a gene moves toward the imperialist
     private static final double REVOLUTION_RATE = 0.1;     // chance a gene mutates randomly
     private static final double ZETA = 0.1;                // weight of mean colony cost in empire total cost
 
-    //-- Fitness weights --
-    private static final double W1_MAKESPAN = 0.5;
-    private static final double W2_COST = 0.3;
-    private static final double W3_UTIL = 0.2;
-    private static final double PRICE_BASE = 0.01;
+    //-- Budget and communication (aligned with OrderAwarePlanningBase) --
+    private static final int EVAL_BUDGET = Integer.getInteger("evals", 3000);
+    private static final boolean USE_COMM = Boolean.getBoolean("comm");
+    private static final double INTER_DC_BW_MBPS = Double.parseDouble(System.getProperty("interDcBw", "15.0"));
+    private static final double INTER_DC_LATENCY = Double.parseDouble(System.getProperty("interDcLatency", "0.05"));
+
+    //-- Fitness weights (aligned with OrderAwarePlanningBase) --
+    private static final double W1_MAKESPAN = Double.parseDouble(System.getProperty("w1", "1.0"));
+    private static final double W2_COST = Double.parseDouble(System.getProperty("w2", "0.0"));
+    private static final double W3_UTIL = Double.parseDouble(System.getProperty("w3", "0.0"));
+    private static final double PRICE_BASE = 0.001;
+
+    protected double w1Makespan = 1.0;
+    protected double w2Cost = 0.0;
+    protected double w3Util = 0.0;
+    protected String normMode = "minmax";
+
+    protected double minMakespanObserved = Double.POSITIVE_INFINITY;
+    protected double maxMakespanObserved = Double.NEGATIVE_INFINITY;
+    protected double minCostObserved = Double.POSITIVE_INFINITY;
+    protected double maxCostObserved = Double.NEGATIVE_INFINITY;
+    protected double minUtilObserved = Double.POSITIVE_INFINITY;
+    protected double maxUtilObserved = Double.NEGATIVE_INFINITY;
+
+    public static double bestEstimatedMakespan = 0.0;
+    private int evalCount = 0;
+
+    private boolean budgetLeft() {
+        return evalCount < EVAL_BUDGET;
+    }
 
     private double refMakespan = 1.0;
     private double refCost = 1.0;
@@ -50,10 +75,10 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
         }
         computeInterDcDelays();
 
-        Log.printLine("HICA planning: " + n + " tasks, " + m + " VMs.");
+        evalCount = 0;
+        Log.printLine("HICA planning: " + n + " tasks, " + m + " VMs, budget " + EVAL_BUDGET + " evals, seed " + SEED);
 
         //-- 1. Initialize countries + reference normalization (Eq. 4) --
-        // HICA Hybrid: seed country[0] with a HEFT greedy schedule for warm start.
         int[][] countries = new int[NUM_COUNTRIES][n];
         double[] cost = new double[NUM_COUNTRIES];
         double sumMakespan = 0;
@@ -66,10 +91,37 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
             }
             repair(countries[i], m);
         }
+        boolean hasW = System.getProperty("w1") != null || System.getProperty("w2") != null || System.getProperty("w3") != null;
+        boolean mo = Boolean.getBoolean("mo");
+        if (hasW) {
+            w1Makespan = Double.parseDouble(System.getProperty("w1", "1.0"));
+            w2Cost = Double.parseDouble(System.getProperty("w2", "0.0"));
+            w3Util = Double.parseDouble(System.getProperty("w3", "0.0"));
+        } else if (mo) {
+            w1Makespan = 0.5;
+            w2Cost = 0.3;
+            w3Util = 0.2;
+        } else {
+            w1Makespan = 1.0;
+            w2Cost = 0.0;
+            w3Util = 0.0;
+        }
+
+        double sumW = w1Makespan + w2Cost + w3Util;
+        if (sumW > 0) {
+            w1Makespan /= sumW;
+            w2Cost /= sumW;
+            w3Util /= sumW;
+        }
+        // Default to "ref" (Paper Eq. 4) for consistent, stationary multi-objective scaling across all algorithms
+        normMode = System.getProperty("norm", "ref");
+
         for (int i = 0; i < NUM_COUNTRIES; i++) {
             initMetrics[i] = computeRawMetrics(countries[i]);
+            evalCount++;
             sumMakespan += initMetrics[i][0];
             sumCost += initMetrics[i][1];
+            updateMetricBounds(initMetrics[i][0], initMetrics[i][1], initMetrics[i][2]);
         }
         refMakespan = sumMakespan / NUM_COUNTRIES;
         refCost = sumCost / NUM_COUNTRIES;
@@ -119,13 +171,17 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
         }
 
         //-- 4. Main ICA loop: assimilation, revolution, competition --
-        for (int iter = 0; iter < MAX_ITER && empires.size() > 1; iter++) {
+        int iter = 0;
+        int maxIter = 10 * EVAL_BUDGET;
+        while (budgetLeft() && iter < maxIter && empires.size() > 1) {
 
             for (Empire empire : empires) {
+                if (!budgetLeft()) break;
                 int[] imperialist = countries[empire.imperialistIdx];
                 List<Integer> colonies = new ArrayList<>(empire.colonyIdx);
 
                 for (int colIdx : colonies) {
+                    if (!budgetLeft()) break;
                     assimilate(countries[colIdx], imperialist);
                     revolt(countries[colIdx], m);
                     repair(countries[colIdx], m); // repair after assimilation + revolution
@@ -141,24 +197,38 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
                 }
             }
 
-            imperialisticCompetition(empires, cost);
+            if (empires.size() > 1) {
+                imperialisticCompetition(empires, cost);
+            }
 
             if (iter % 10 == 0) {
                 Empire strongest = strongestEmpire(empires, cost);
-                Log.printLine("HICA iter " + iter + " best cost = " + cost[strongest.imperialistIdx]
-                        + " empires remaining = " + empires.size());
+                double[] bMetrics = computeRawMetrics(countries[strongest.imperialistIdx]);
+                Log.printLine("HICA step " + iter + " | evals " + evalCount
+                        + " | best est. makespan " + String.format("%.3f", bMetrics[0])
+                        + " | best cost " + String.format("%.4f", cost[strongest.imperialistIdx])
+                        + " | empires " + empires.size());
             }
+            iter++;
         }
 
         //-- 5. Apply the best mapping found --
         Empire best = strongestEmpire(empires, cost);
         int[] bestMapping = countries[best.imperialistIdx];
+        double[] bestMetrics = computeRawMetrics(bestMapping);
+        bestEstimatedMakespan = bestMetrics[0];
+
         for (int t = 0; t < n; t++) {
             Task task = topoOrder.get(t);
             CondorVM vm = (CondorVM) getVmList().get(bestMapping[t]);
             task.setVmId(vm.getId());
+            task.setPriority(t);
         }
-        Log.printLine("HICA planning finished, best cost = " + cost[best.imperialistIdx]);
+        Log.printLine("HICA planning finished after " + iter + " steps, " + evalCount + " evaluations"
+                + "\n  -> estimated makespan: " + String.format("%.3f", bestMetrics[0])
+                + " | estimated cost: " + String.format("%.4f", bestMetrics[1])
+                + " | utilization: " + String.format("%.3f", bestMetrics[2])
+                + "\n  -> compare the estimate with the simulated makespan printed by the driver");
     }
 
     // DAG + fitness
@@ -183,10 +253,11 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
     }
 
     private void computeInterDcDelays() {
+        if (!USE_COMM) return;
         int n = topoOrder.size();
         interDcTransferDelay = new double[n][n];
-        double interDcBwMBps = 15.0; // 15 MB/s (~120 Mbps) inter-DC WAN bandwidth
-        double minLatency = 0.05;    // 50ms baseline WAN latency
+        double interDcBwMBps = INTER_DC_BW_MBPS; // inter-DC WAN bandwidth
+        double minLatency = INTER_DC_LATENCY;    // baseline WAN latency
 
         for (int pIdx = 0; pIdx < n; pIdx++) {
             Task parent = topoOrder.get(pIdx);
@@ -236,7 +307,7 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
                 if (pFinish != null) {
                     int pIdx = taskIndexMap.get(parent);
                     boolean parentInDC0 = mapping[pIdx] < dc0VmCount;
-                    double comm = (parentInDC0 != childInDC0) ? interDcTransferDelay[pIdx][idx] : 0.0;
+                    double comm = (USE_COMM && interDcTransferDelay != null && parentInDC0 != childInDC0) ? interDcTransferDelay[pIdx][idx] : 0.0;
                     readyTime = Math.max(readyTime, pFinish + comm);
                 }
             }
@@ -264,15 +335,55 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
         return new double[]{makespan, totalCost, resourceUtil};
     }
 
-    private double calcFitness(double[] metrics) {
-        double normMakespan = refMakespan > 0 ? metrics[0] / refMakespan : metrics[0];
-        double normCost = refCost > 0 ? metrics[1] / refCost : metrics[1];
-        double normUtil = 1.0 - metrics[2];
+    public void updateMetricBounds(double makespan, double cost, double util) {
+        if (makespan < minMakespanObserved) minMakespanObserved = makespan;
+        if (makespan > maxMakespanObserved) maxMakespanObserved = makespan;
+        if (cost < minCostObserved) minCostObserved = cost;
+        if (cost > maxCostObserved) maxCostObserved = cost;
+        if (util < minUtilObserved) minUtilObserved = util;
+        if (util > maxUtilObserved) maxUtilObserved = util;
+    }
 
-        return W1_MAKESPAN * normMakespan + W2_COST * normCost + W3_UTIL * normUtil;
+    public void setWeights(double w1, double w2, double w3) {
+        this.w1Makespan = w1;
+        this.w2Cost = w2;
+        this.w3Util = w3;
+        double sum = w1 + w2 + w3;
+        if (sum > 0) {
+            this.w1Makespan /= sum;
+            this.w2Cost /= sum;
+            this.w3Util /= sum;
+        }
+    }
+
+    private double calcFitness(double[] metrics) {
+        updateMetricBounds(metrics[0], metrics[1], metrics[2]);
+
+        double normM;
+        double normC;
+        double normU;
+
+        if ("ref".equalsIgnoreCase(normMode)) {
+            normM = refMakespan > 0 ? metrics[0] / refMakespan : metrics[0];
+            normC = refCost > 0 ? metrics[1] / refCost : metrics[1];
+            normU = 1.0 - metrics[2];
+        } else {
+            normM = (maxMakespanObserved > minMakespanObserved + 1e-6)
+                    ? (metrics[0] - minMakespanObserved) / (maxMakespanObserved - minMakespanObserved)
+                    : (refMakespan > 0 ? metrics[0] / refMakespan : metrics[0]);
+            normC = (maxCostObserved > minCostObserved + 1e-6)
+                    ? (metrics[1] - minCostObserved) / (maxCostObserved - minCostObserved)
+                    : (refCost > 0 ? metrics[1] / refCost : metrics[1]);
+            normU = (maxUtilObserved > minUtilObserved + 1e-6)
+                    ? (maxUtilObserved - metrics[2]) / (maxUtilObserved - minUtilObserved)
+                    : (1.0 - metrics[2]);
+        }
+
+        return w1Makespan * normM + w2Cost * normC + w3Util * normU;
     }
 
     private double evaluate(int[] mapping) {
+        evalCount++;
         return calcFitness(computeRawMetrics(mapping));
     }
 
@@ -342,49 +453,6 @@ public class HICAPlanningAlgorithm extends BasePlanningAlgorithm {
             if (p == b) return true;
         }
         return false;
-    }
-
-    /**
-     * HEFT-inspired greedy seed: assigns each task (in topological order) to the VM
-     * that gives the earliest finish time, considering both VM availability and
-     * parent-task completion times. This warm-starts the population with a strong
-     * feasible schedule — the key "H" (hybrid) component of HICA.
-     */
-    private int[] heftSeed(int n, int m) {
-        int[] assignment = new int[n];
-        double[] vmFreeAt = new double[m];
-        Map<Task, Double> finishTime = new HashMap<>();
-
-        for (int idx = 0; idx < n; idx++) {
-            Task task = topoOrder.get(idx);
-
-            // Earliest time this task can start (all parents done)
-            double dataReadyTime = 0;
-            for (Object p : task.getParentList()) {
-                dataReadyTime = Math.max(dataReadyTime, finishTime.get((Task) p));
-            }
-
-            // Pick the VM that gives the earliest finish time (EFT)
-            int bestVm = 0;
-            double bestEFT = Double.MAX_VALUE;
-            for (int v = 0; v < m; v++) {
-                CondorVM vm = (CondorVM) getVmList().get(v);
-                double startTime = Math.max(vmFreeAt[v], dataReadyTime);
-                double eft = startTime + task.getCloudletLength() / vm.getMips();
-                if (eft < bestEFT) {
-                    bestEFT = eft;
-                    bestVm = v;
-                }
-            }
-
-            assignment[idx] = bestVm;
-            CondorVM chosenVm = (CondorVM) getVmList().get(bestVm);
-            double startTime = Math.max(vmFreeAt[bestVm], dataReadyTime);
-            double eft = startTime + task.getCloudletLength() / chosenVm.getMips();
-            finishTime.put(task, eft);
-            vmFreeAt[bestVm] = eft;
-        }
-        return assignment;
     }
 
     private Empire strongestEmpire(List<Empire> empires, double[] cost) {

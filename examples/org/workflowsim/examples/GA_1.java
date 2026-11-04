@@ -18,7 +18,7 @@ public class GA_1 {
     public static void main(String[] args) {
         try {
             int vmNum = 20;
-            String daxPath = "config/dax/Montage_100.xml";
+            String daxPath = System.getProperty("dax", "config/dax/Montage_100.xml");
 
             if (!SimSetup.setupParameters(vmNum, daxPath, Parameters.PlanningAlgorithm.GA)) {
                 return;
@@ -43,7 +43,8 @@ public class GA_1 {
             List<Cloudlet> outputList = wfEngine.getJobsReceivedList();
             CloudSim.stopSimulation();
 
-            SimSetup.printResults("GENETIC ALGORITHM RESULTS", outputList, vmList, dcNames);
+            SimSetup.printResults("GENETIC ALGORITHM RESULTS", outputList, vmList, dcNames,
+                    org.workflowsim.planning.GAPlanningAlgorithm.bestEstimatedMakespan);
 
         } catch (Exception e) {
             Log.printLine("Error: " + e.getMessage());

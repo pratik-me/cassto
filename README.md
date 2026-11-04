@@ -1,45 +1,119 @@
 # CASSTO: QoS-Oriented Scientific Workflow Scheduling in Cloud Computing
 
-An extension of the **WorkflowSim 1.0** toolkit implementing and benchmarking **CASSTO** (*Cloud-Aware Seal Search Task Optimization*) and comparative metaheuristic scheduling algorithms for scientific workflows in cloud computing environments.
+An enhanced, empirically audited extension of the **WorkflowSim 1.0** toolkit implementing and benchmarking **CASSTO** (*Cloud-Aware Seal Search Task Optimization*) alongside comparative evolutionary metaheuristics (**GA**, **HICA**) and classical list heuristics (**HEFT**, **DHEFT**, **Random**) for scientific workflows in heterogeneous cloud computing environments.
 
 ---
 
-## 📌 Overview & Academic Background
+## 📌 Academic Context & Background
 
-This repository provides the reference Java implementation and evaluation testbeds for the academic paper:
+This repository contains the Java implementation, bug fixes, empirical auditing framework, and benchmarking testbeds corresponding to the study:
 
-> **"CASSTO: a bio‑inspired metaheuristic for QoS‑oriented scientific workflow scheduling in cloud computing"**  
-> *Hameed R. et al., Journal of Supercomputing (2026).*
+> **"CASSTO: a bio-inspired metaheuristic for QoS-oriented scientific workflow scheduling in cloud computing"**  
+> *Hameed R. et al., The Journal of Supercomputing (2026).*
 
-Scientific workflow scheduling in cloud environments is an NP-hard optimization problem involving conflicting Quality of Service (QoS) criteria such as makespan, monetary execution cost, and resource utilization under strict DAG task precedence constraints. 
+Scientific workflow scheduling in cloud environments is an NP-hard multi-objective optimization problem. Schedulers must map workflow tasks (Directed Acyclic Graphs, or DAGs) onto heterogeneous Virtual Machines (VMs) while simultaneously optimizing conflicting Quality of Service (QoS) criteria: **Makespan**, **Financial Cost**, and **Resource Utilization**, while strictly obeying task dependency constraints.
 
-This project extends **WorkflowSim 1.0** with novel bio-inspired and evolutionary metaheuristics, allowing researchers and practitioners to seamlessly compare the performance of **CASSTO** against other metaheuristics (**HICA**, **GA**) and standard workflow heuristics (**HEFT**, **DHEFT**, **Random**).
+---
+
+## 🔬 Empirical Audit: Key Fixes & Architectural Enhancements
+
+During rigorous replication and ablation studies, several critical architectural defects and confounding design flaws in the original paper/codebase were identified and repaired in [`CASSTOPlanningAlgorithm.java`](sources/org/workflowsim/planning/CASSTOPlanningAlgorithm.java) and [`OrderAwarePlanningBase.java`](sources/org/workflowsim/planning/OrderAwarePlanningBase.java):
+
+### 1. Task Pool Partitioning Decoupling (`cassto.pool=none|urgent`)
+* **Original Issue**: Brownian moves picked *only* from normal tasks, and Lévy flights picked *only* from urgent tasks. In `schedule` and `diversity` modes, this created an unintended hard partition: normal tasks were trapped in local VM moves forever, and urgent tasks could only ever take global jumps.
+* **Our Enhancement**: Added the explicit property `cassto.pool=none|urgent`. In `schedule` and `diversity` modes, `cassto.pool=none` allows all tasks to undergo both Brownian exploitation and Lévy exploration, preserving `urgent` strictly for critical-path urgency mode.
+
+### 2. Brownian Step Size Execution in Urgency Mode
+* **Original Issue**: The paper claimed that Brownian step size $bMoves$ adapts dynamically. However, in `urgency` mode, the search called `brownianTaskMove()`, which had a hardcoded 1-task swap. The variable `currentBrownianMoves` was only read in `brownianMove()`, rendering Brownian adaptation completely inactive in urgency mode!
+* **Our Enhancement**: Connected `currentBrownianMoves` directly to `brownianTaskMove()`, allowing it to execute $k = 1 \dots currentBrownianMoves$ swaps per move.
+
+### 3. Scale-Invariant Stagnation Tracking
+* **Original Issue**: Stagnation was measured using composite fitness under dynamically shifting Min-Max bounds (Paper Eq. 12). Because bounds updated every iteration, fitness values changed scale, causing false resets and failing to increment the stagnation counter when adaptation was disabled.
+* **Our Enhancement**: Stagnation is tracked using the scale-invariant, unnormalized makespan:
+  ```java
+  double bestRaw = best.rawMetrics[0];
+  if (bestRaw < prevBestRaw - 1e-6) {
+      stagnationCount = 0;
+      alphaBurstDone = false;
+      brownianBurstDone = false;
+      prevBestRaw = bestRaw;
+  } else {
+      stagnationCount++;
+  }
+  ```
+
+### 4. Normalized Relative Population Diversity Threshold
+* **Original Issue**: Population diversity $d$ was compared directly against a static threshold $\sim 0.15$ or $0.25$. In 100-task workflow DAGs, pairwise topological Hamming distance rarely drops below $0.70$. As a result, $d < 0.25$ was mathematically unreachable, and the diversity-driven phase switch never fired.
+* **Our Enhancement**: Normalized diversity to relative population dispersion: $relD = d / initialDiversity$.
+
+### 5. Stabilized Online Adaptation Feedback Law
+* **Original Issue**: The adaptation loop evaluated win rates on iteration 1 (causing zero-attempt spikes), lacked minimum-attempt guards, and multiplied $\alpha$ by $1.15$ on *every* stagnant iteration, saturating $\alpha$ to its upper limit within ~12 iterations.
+* **Our Enhancement**:
+  - Updates strictly synchronize with window boundaries: `(iter + 1) % WINDOW == 0`.
+  - Added sample size protection: `windowLevyAttempts >= MIN_ATTEMPTS`.
+  - Replaced runaway scaling with equilibrium exponential tuning: $\alpha \leftarrow \alpha \cdot \exp(\eta \cdot (rate - rate_{target}))$.
+  - Introduced independent one-shot burst flags (`alphaBurstDone` and `brownianBurstDone`) cleared only on true makespan improvement.
+
+### 6. Simulated Annealing Brownian Cooling Schedule
+* **Our Enhancement**: Added support for continuous step decay (`cassto.brownianDecay=true`), linearly annealing the Brownian step size from $8 \to 1$ over the evaluation budget.
+
+### 7. Unified Multi-Objective Metric Normalization
+* **Original Issue**: CASSTO refreshed min-max bounds dynamically while GA fell through to an unnormalized reference branch, skewing cross-algorithm comparisons.
+* **Our Enhancement**: Standardized unified reference normalization (`norm=ref`, Eq. 4) across both CASSTO and GA, guaranteeing mathematically fair comparisons.
 
 ---
 
 ## 🚀 Implemented Algorithms
 
-| Algorithm | Type | Implementation Class | Description |
+| Algorithm | Type | Core Class | Search Mechanism |
 | :--- | :--- | :--- | :--- |
-| **CASSTO** | Bio-inspired Metaheuristic | [`CASSTOPlanningAlgorithm.java`](sources/org/workflowsim/planning/CASSTOPlanningAlgorithm.java) | **Cloud-Aware Seal Search Task Optimization**: Uses Brownian search for local exploitation and Lévy flight jumps for global exploration, guided by population diversity metrics and task urgency (critical path). |
-| **HICA** | Evolutionary Metaheuristic | [`HICAPlanningAlgorithm.java`](sources/org/workflowsim/planning/HICAPlanningAlgorithm.java) | **Hybrid Imperialist Competitive Algorithm**: Socio-politically inspired metaheuristic with imperialist assimilation, colony revolution, and inter-empire competition. |
-| **GA** | Evolutionary Metaheuristic | [`GAPlanningAlgorithm.java`](sources/org/workflowsim/planning/GAPlanningAlgorithm.java) | **Genetic Algorithm**: Standard baseline featuring tournament selection ($k=3$), uniform crossover ($p_c=0.8$), mutation ($p_m=0.05$), and elitism. |
-| **HEFT** | List-Scheduling Heuristic | [`HEFTPlanningAlgorithm.java`](sources/org/workflowsim/planning/HEFTPlanningAlgorithm.java) | **Heterogeneous Earliest Finish Time**: Deterministic DAG scheduling baseline prioritizing tasks via upward rank values ($rank_u$). |
-| **DHEFT** | Dynamic Heuristic | [`DHEFTPlanningAlgorithm.java`](sources/org/workflowsim/planning/DHEFTPlanningAlgorithm.java) | **Dynamic HEFT**: Adaptive variation of HEFT for heterogeneous environments. |
+| **CASSTO** | Bio-inspired Metaheuristic | [`CASSTOPlanningAlgorithm.java`](sources/org/workflowsim/planning/CASSTOPlanningAlgorithm.java) | Hybrid Brownian local search ($bMoves \in [1, 10]$) and heavy-tailed Lévy flight jumps ($\alpha \in [0.5, 6.0]$), with optional online feedback adaptation. |
+| **GA** | Evolutionary Metaheuristic | [`GAPlanningAlgorithm.java`](sources/org/workflowsim/planning/GAPlanningAlgorithm.java) | Genetic Algorithm with tournament selection ($k=3$), uniform order crossover ($p_c=0.8$), bit/gene mutation ($p_m=0.05$), and elitism. |
+| **HICA** | Evolutionary Metaheuristic | [`HICAPlanningAlgorithm.java`](sources/org/workflowsim/planning/HICAPlanningAlgorithm.java) | Hybrid Imperialist Competitive Algorithm with empire assimilation, colony revolution, and imperial competition. |
+| **HEFT** | List Heuristic | [`HEFTPlanningAlgorithm.java`](sources/org/workflowsim/planning/HEFTPlanningAlgorithm.java) | Heterogeneous Earliest Finish Time prioritizing tasks via upward rank values ($rank_u$). |
+| **DHEFT** | Dynamic Heuristic | [`DHEFTPlanningAlgorithm.java`](sources/org/workflowsim/planning/DHEFTPlanningAlgorithm.java) | Dynamic variation of HEFT adapting to runtime state changes. |
 | **Random** | Baseline | [`RandomPlanningAlgorithm.java`](sources/org/workflowsim/planning/RandomPlanningAlgorithm.java) | Uniformly distributes tasks randomly across available VMs. |
 
 ---
 
-## 🎯 QoS Objectives & Multi-Objective Fitness Model
+## ⚙️ Configurable JVM Properties & Execution Flags
 
-To ensure fair and rigorous benchmarking across CASSTO, HICA, and GA, all metaheuristics share an identical DAG traversal pipeline and weighted-sum fitness formulation:
+All algorithm parameters can be dynamically injected via `-D` flags without re-compiling:
 
-$$\text{Fitness} = w_1 \cdot \text{Makespan}_{\text{norm}} + w_2 \cdot \text{Cost}_{\text{norm}} + w_3 \cdot (1 - \text{ResourceUtilization})$$
+| Property | Default | Options / Range | Description |
+| :--- | :---: | :---: | :--- |
+| `cassto.mode` | `urgency` | `urgency`, `schedule`, `diversity` | Exploration/exploitation phase control mode. |
+| `cassto.pool` | `urgent` | `none`, `urgent` | Task pool partitioning (`none` lets all tasks move in both phases). |
+| `cassto.brownianMoves` | `1` | `1`, `4`, `8`, etc. | Number of task swaps executed per Brownian local move. |
+| `cassto.alpha` | `2.0` | `0.5` – `6.0` | Lévy flight power-law distribution exponent. |
+| `cassto.adaptive` | `false` | `true`, `false` | Enables/disables online RL win-rate feedback adaptation. |
+| `cassto.adaptiveInit` | `false` | `true`, `false` | Enables/disables DAG topology-based parameter initialization. |
+| `cassto.brownianDecay` | `false` | `true`, `false` | Linearly anneals Brownian step size from `brownianDecayFrom` to `brownianDecayTo`. |
+| `cassto.brownianDecayFrom` | `8.0` | Float | Starting step size for Brownian decay schedule. |
+| `cassto.brownianDecayTo` | `1.0` | Float | Final step size for Brownian decay schedule. |
+| `evals` | `3000` | `3000`, `10000`, `30000` | Maximum candidate schedule evaluation budget. |
+| `seed` | `42` | Long | Random number generator seed for strict reproducibility. |
+| `sameVmSwap` | `true` | `true`, `false` | Permits intra-VM task order swapping during Brownian moves. |
 
-- **Makespan**: Maximum completion time across all workflow tasks.
-- **Cost**: VM computation cost based on execution duration and VM processing capacity (MIPS-rate pricing model).
-- **Resource Utilization**: Ratio of busy VM execution time to total VM active leasing time.
-- **Precedence Integrity**: Topological ordering guarantees 100% valid task execution without precedence violations.
+---
+
+## 📊 Summary of Empirical Findings
+
+Extensive statistical benchmarking (>600 simulation runs across Montage_100, CyberShake, and heterogeneous cloud environments) revealed the following scientific insights:
+
+1. **4-Arm Ablation & Controller Isolation**:
+   - The reported ~8.3% improvement of "Adaptive On" over default CASSTO was **not** caused by the online feedback controller.
+   - When initial parameters are matched, **Adaptive does not outperform Fixed-4** ($p = 0.4825$).
+   - The online controller’s primary function is **variance damping** (reduces IQR by up to 70%), not mean makespan optimization.
+2. **$2 \times 2$ Factorial Two-Way ANOVA ($b \in \{1, 4\} \times \alpha \in \{2.0, 2.5\}$)**:
+   - **Brownian Step Size ($b$)**: Explains **28.78% of total makespan variance** ($F = 47.67, p = 2.86 \times 10^{-10}$).
+   - **Lévy Exponent ($\alpha$)**: Explains only **0.91% of variance** ($F = 1.50, p = 0.222$, statistically insignificant).
+   - **Interaction ($b \times \alpha$)**: Negligible ($0.27\%$, $p = 0.506$).
+3. **Evaluation Budget Scaling (3,000 $\to$ 10,000 $\to$ 30,000 evaluations)**:
+   - Step size acts as both a **convergence speed lever** and a **topological barrier-crossing operator**.
+   - Step-1 drops from 81.19s down to 60.66s at 30k evals, but **Step-4 remains significantly superior** (58.16s, $p = 3.52 \times 10^{-7}$).
+4. **Genetic Algorithm vs. CASSTO**:
+   - Standard **GA with crossover recombination consistently outperforms CASSTO** across all evaluation tiers (e.g., at 30k evals, GA reaches **54.16s** with best individual **48.89s**, beating CASSTO's 58.16s with $p = 6.52 \times 10^{-9}$).
 
 ---
 
@@ -57,22 +131,29 @@ WorkflowSim-1/
 ├── sources/
 │   └── org/workflowsim/
 │       ├── planning/                # Core planning algorithms
-│       │   ├── CASSTOPlanningAlgorithm.java
-│       │   ├── HICAPlanningAlgorithm.java
-│       │   ├── GAPlanningAlgorithm.java
-│       │   ├── HEFTPlanningAlgorithm.java
-│       │   ├── DHEFTPlanningAlgorithm.java
-│       │   └── RandomPlanningAlgorithm.java
-│       ├── scheduling/              # Scheduling & VM mapping handlers
-│       ├── WorkflowPlanner.java     # Planner orchestrator
-│       └── WorkflowEngine.java      # Workflow execution engine
+│       │   ├── CASSTOPlanningAlgorithm.java  # Audited & enhanced CASSTO
+│       │   ├── GAPlanningAlgorithm.java       # Standard Genetic Algorithm
+│       │   ├── HICAPlanningAlgorithm.java     # Hybrid Imperialist Competitive Algorithm
+│       │   ├── HEFTPlanningAlgorithm.java     # List heuristic baseline
+│       │   ├── DHEFTPlanningAlgorithm.java    # Dynamic list heuristic
+│       │   ├── OrderAwarePlanningBase.java    # Shared evaluation & DAG engine
+│       │   └── RandomPlanningAlgorithm.java   # Random baseline
+│       ├── scheduling/              # VM scheduling handlers
+│       └── WorkflowEngine.java      # Workflow execution simulation core
 ├── examples/
 │   └── org/workflowsim/examples/
-│       ├── CASSTO_1.java            # CASSTO execution example & benchmark runner
-│       ├── HICA.java                # HICA execution example
-│       ├── GA_1.java                # GA execution example
-│       └── planning/                # HEFT & DHEFT example runners
-├── lib/                             # Required runtime JAR libraries
+│       ├── CASSTO_1.java            # CASSTO driver
+│       ├── GA_1.java                # GA driver
+│       └── HICA.java                # HICA driver
+├── tmp/analysis/                    # Automated Python benchmarking & statistical suite
+│   ├── auto_runner.py               # Parallel simulation runner with metrics parser
+│   ├── run_ablation_arms.py         # 4-arm controller ablation study
+│   ├── run_factorial_2x2.py         # 2x2 Factorial ANOVA (Brownian Step x Levy Alpha)
+│   ├── run_eval_scaling.py          # Budget scaling evaluation (3k, 10k, 30k evals)
+│   ├── run_ga_eval_scaling.py       # GA vs CASSTO scaling comparison
+│   ├── run_decay_vs_fixed4.py       # Simulated annealing step decay study
+│   └── statistical_tests.py         # Mann-Whitney U, Wilcoxon, Cliff's delta, Two-way ANOVA
+├── lib/                             # Required runtime JAR dependencies
 │   ├── commons-math3-3.2.jar
 │   ├── flanagan.jar
 │   └── jdom-2.0.0.jar
@@ -81,70 +162,45 @@ WorkflowSim-1/
 
 ---
 
-## 🛠️ Prerequisites & Setup
+## 🛠️ Build & Execution Guide
 
-- **Java Development Kit (JDK)**: Java 8 or newer (JDK 8 / 11 / 17 / 21+).
-- **IDE (Recommended)**: Eclipse, IntelliJ IDEA, VS Code, or NetBeans.
+### 1. Compilation
+Compile all Java sources and examples into the `bin/` directory:
+```bash
+# On Windows (PowerShell):
+Get-ChildItem -Recurse sources/*.java, examples/*.java | Resolve-Path -Relative | Out-File -Encoding ascii sources.txt
+javac -cp "lib/*;classes;bin" -d bin "@sources.txt"
 
-### Adding External Libraries
-Ensure all JAR files in `lib/` are present in your Java project's Build Path:
-1. `lib/commons-math3-3.2.jar`
-2. `lib/flanagan.jar`
-3. `lib/jdom-2.0.0.jar`
-
----
-
-## ⚡ Quickstart & Running Comparisons
-
-You can execute the example classes directly to run simulations and compare algorithm metrics.
-
-### 1. Running CASSTO
-Run [`CASSTO_1.java`](examples/org/workflowsim/examples/CASSTO_1.java):
-```java
-// Configure target workflow DAX file:
-String daxPath = "config/dax/Montage_1000.xml";
-
-// Set planning algorithm:
-Parameters.PlanningAlgorithm pln_method = Parameters.PlanningAlgorithm.CASSTO;
-Parameters.SchedulingAlgorithm sch_method = Parameters.SchedulingAlgorithm.STATIC;
+# On Linux/macOS:
+find sources examples -name "*.java" > sources.txt
+javac -cp "lib/*:classes:bin" -d bin @sources.txt
 ```
 
-### 2. Running Comparative Baselines
-- **HICA**: Run [`HICA.java`](examples/org/workflowsim/examples/HICA.java)
-- **GA**: Run [`GA_1.java`](examples/org/workflowsim/examples/GA_1.java)
-- **HEFT**: Run [`HEFTPlanningAlgorithmExample1.java`](examples/org/workflowsim/examples/planning/HEFTPlanningAlgorithmExample1.java)
-- **DHEFT**: Run [`DHEFTPlanningAlgorithmExample1.java`](examples/org/workflowsim/examples/planning/DHEFTPlanningAlgorithmExample1.java)
+### 2. Running Simulations Directly via Java
+```bash
+# Run CASSTO with fixed Brownian step = 4 and 10,000 evaluations:
+java -Dseed=101 -Dcassto.brownianMoves=4 -Devals=10000 -cp "bin;lib/*" org.workflowsim.examples.CASSTO_1
 
-### 3. Fair Benchmarking Setup
-To maintain consistency during comparative evaluation:
-- Use the **same DAX file** (e.g., `Montage_1000.xml`, `CyberShake_1000.xml`).
-- Maintain the **same VM pool** (Default: 20 heterogeneous VMs with cyclic 1000 / 2000 / 3000 MIPS).
-- Use `STATIC` scheduling mode so the planner's VM mappings are preserved during simulation execution.
+# Run Genetic Algorithm baseline:
+java -Dseed=101 -Devals=10000 -cp "bin;lib/*" org.workflowsim.examples.GA_1
+```
 
----
+### 3. Automated Parallel Python Test Suite
+The repository includes an automated parallel execution and statistical analysis harness in `tmp/analysis/`:
+```bash
+# Run 30 paired simulations in parallel (6 workers):
+python tmp/analysis/auto_runner.py --runs 30 --seed-start 101 --algos CASSTO --workers 6 --prop cassto.brownianMoves=4
 
-## 📊 Sample Output
+# Run the 2x2 Factorial ANOVA study:
+python tmp/analysis/run_factorial_2x2.py --seed-start 101 --runs 30
 
-When running `CASSTO_1.java`, execution logs and performance metrics are displayed in the console:
-
-```plaintext
-CASSTO planning: 1000 tasks, 20 VMs.
-CASSTO iter 1 best fitness = 0.4812
-CASSTO iter 25 best fitness = 0.3951
-CASSTO iter 50 best fitness = 0.3542
-CASSTO iter 100 best fitness = 0.3128
-CASSTO planning finished, best fitness = 0.3128
-
-========== CASSTO RESULTS ==========
-Number of jobs: 1000
-Makespan: 218.45
+# Run evaluation scaling comparison (3k, 10k, 30k):
+python tmp/analysis/run_eval_scaling.py --seed-start 101 --runs 30
 ```
 
 ---
 
 ## 📖 Citation & References
-
-If you use this implementation in your research, please cite the following papers:
 
 ```bibtex
 @article{hameed2026cassto,
@@ -167,4 +223,4 @@ If you use this implementation in your research, please cite the following paper
 ---
 
 ## 📄 License
-This software is distributed under the Apache License Version 2.0. See [`license.txt`](license.txt) and [`license-workflowsim.txt`](license-workflowsim.txt) for full details.
+Distributed under the Apache License Version 2.0. See [`license.txt`](license.txt) and [`license-workflowsim.txt`](license-workflowsim.txt) for details.

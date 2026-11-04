@@ -21,7 +21,7 @@ public class HICA {
     public static void main(String[] args) {
         try {
             int vmNum = 20;
-            String daxPath = "config/dax/Montage_50.xml";
+            String daxPath = System.getProperty("dax", "config/dax/Montage_100.xml");
 
             if (!SimSetup.setupParameters(vmNum, daxPath, Parameters.PlanningAlgorithm.HICA)) {
                 return;
@@ -46,7 +46,8 @@ public class HICA {
             List<Cloudlet> outputList = wfEngine.getJobsReceivedList();
             CloudSim.stopSimulation();
 
-            SimSetup.printResults("HICA RESULTS", outputList, vmList, dcNames);
+            SimSetup.printResults("HICA RESULTS", outputList, vmList, dcNames,
+                    org.workflowsim.planning.HICAPlanningAlgorithm.bestEstimatedMakespan);
 
         } catch (Exception e) {
             Log.printLine("Error: " + e.getMessage());

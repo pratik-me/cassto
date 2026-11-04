@@ -21,7 +21,9 @@ import org.cloudbus.cloudsim.Log;
 import org.cloudbus.cloudsim.core.CloudSimTags;
 import org.cloudbus.cloudsim.core.SimEntity;
 import org.cloudbus.cloudsim.core.SimEvent;
+import org.workflowsim.examples.CASSTO_Paper;
 import org.workflowsim.planning.BasePlanningAlgorithm;
+import org.workflowsim.planning.CASSTOPaperPlanningAlgorithm;
 import org.workflowsim.planning.CASSTOPlanningAlgorithm;
 import org.workflowsim.planning.DHEFTPlanningAlgorithm;
 import org.workflowsim.planning.GAPlanningAlgorithm;
@@ -202,6 +204,9 @@ public final class WorkflowPlanner extends SimEntity {
             case GA:
             	planner = new GAPlanningAlgorithm();
             	break;
+            case CASSTO_PAPER:
+                planner = new CASSTOPaperPlanningAlgorithm();
+                break;
             default:
                 planner = null;
                 break;

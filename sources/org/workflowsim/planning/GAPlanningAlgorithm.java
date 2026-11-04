@@ -14,9 +14,12 @@ public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
     private static final boolean MUT_PER_GENE = Boolean.parseBoolean(System.getProperty("ga.mutPerGene", "false"));
     private static final boolean DEDUPE = Boolean.parseBoolean(System.getProperty("ga.dedupe", "true"));
 
+    public static double bestEstimatedMakespan = 0.0;
+
     @Override
     public void run() {
         prepare();
+        bestEstimatedMakespan = 0.0;
         Log.printLine("GA planning: " + n + " tasks, " + m + " VMs, pop " + POP_SIZE
                 + ", pc " + CROSSOVER_PROB + ", pm " + MUTATION_PROB
                 + (MUT_PER_GENE ? " (per gene)" : " (per offspring)")
@@ -26,15 +29,21 @@ public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
         List<Individual> pop = new ArrayList<>(POP_SIZE);
         for (int i = 0; i < POP_SIZE; i++) {
             Individual ind = randomIndividual();
-            evaluate(ind);
+            repair(ind);
+            ind.rawMetrics = computeRawMetrics(ind);
+            evalCount++;
+            ind.dirty = false;
             pop.add(ind);
         }
+        refreshBounds(pop, null);
         Individual best = bestOf(pop).cloneIndividual();
 
         // -- Generation loop (L8-37), stops on evaluation budget --
         int gen = 0;
         int genCap = 10 * EVAL_BUDGET;     // safety net if pc and pm are ~0 and no evaluations happen
         while (budgetLeft() && gen < genCap) {
+            refreshBounds(pop, best);
+
             List<Individual> kids = breed(pop);
 
             // L26-30: repair + evaluate.
@@ -45,7 +54,7 @@ public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
                 evaluated.add(k);
             }
 
-            pop = selectSurvivors(pop, evaluated);       // L31-33
+            pop = selectSurvivors(pop, evaluated, best); // L31-33
 
             Individual top = pop.get(0);                 // L34-36
             if (top.fitness < best.fitness) best = top.cloneIndividual();
@@ -54,6 +63,7 @@ public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
             gen++;
         }
 
+        bestEstimatedMakespan = best.rawMetrics[0];
         applySolution(best);
         logFinal("GA", best, gen);
     }
@@ -157,10 +167,13 @@ public class GAPlanningAlgorithm extends OrderAwarePlanningBase {
         }
     }
 
-    private List<Individual> selectSurvivors(List<Individual> parents, List<Individual> kids) {
-        List<Individual> all = new ArrayList<>(parents.size() + kids.size());
+    private List<Individual> selectSurvivors(List<Individual> parents, List<Individual> kids, Individual best) {
+        List<Individual> all = new ArrayList<>(parents.size() + kids.size() + (best != null ? 1 : 0));
         all.addAll(parents);
         all.addAll(kids);
+        if (best != null) {
+            all.add(best.cloneIndividual());
+        }
         all.sort(Comparator.comparingDouble((Individual x) -> x.fitness));   // List.sort is stable
 
         if (!DEDUPE) {

@@ -18,9 +18,32 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
     protected static final int EVAL_BUDGET = Integer.getInteger("evals", 3000);
     protected static final boolean SAME_VM_SWAP = Boolean.getBoolean("sameVmSwap");
 
+    // Legacy static constants (retained for backward compatibility)
     protected static final double W1_MAKESPAN = dbl("w1", 1.0);
     protected static final double W2_COST = dbl("w2", 0.0);
     protected static final double W3_UTIL = dbl("w3", 0.0);
+
+    // Multi-objective normalized weights & normalization mode (Paper Eq. 4 & Eq. 12)
+    protected double w1Makespan = 1.0;
+    protected double w2Cost = 0.0;
+    protected double w3Util = 0.0;
+    protected String normMode = "ref";
+
+    // Dynamic metric bounds for Min-Max normalization (Paper Eq. 12, Page 16)
+    protected double minMakespanObserved = Double.POSITIVE_INFINITY;
+    protected double maxMakespanObserved = Double.NEGATIVE_INFINITY;
+    protected double minCostObserved = Double.POSITIVE_INFINITY;
+    protected double maxCostObserved = Double.NEGATIVE_INFINITY;
+    protected double minUtilObserved = Double.POSITIVE_INFINITY;
+    protected double maxUtilObserved = Double.NEGATIVE_INFINITY;
+
+    // Frozen bounds per iteration (ensures consistent scoring across candidate evaluations)
+    protected double frozenMinMakespan = Double.POSITIVE_INFINITY;
+    protected double frozenMaxMakespan = Double.NEGATIVE_INFINITY;
+    protected double frozenMinCost = Double.POSITIVE_INFINITY;
+    protected double frozenMaxCost = Double.NEGATIVE_INFINITY;
+    protected double frozenMinUtil = Double.POSITIVE_INFINITY;
+    protected double frozenMaxUtil = Double.NEGATIVE_INFINITY;
 
     protected static final boolean USE_COMM = Boolean.getBoolean("comm");
     protected static final double INTER_DC_BW_MBPS = dbl("interDcBw", 15.0);
@@ -45,7 +68,6 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
         return mips[v];
     }
 
-    // ---------- problem context (filled by prepare()) ----------
     protected List<Task> taskList;
     protected Map<Task, Integer> taskIndexMap;
     protected int n; // number of tasks
@@ -53,14 +75,13 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
     protected Random rnd;
     protected int evalCount;
 
-    private double[] length; // task length (MI)
-    private double[] mips; // VM speed
-    private double[] price; // VM price per second
-    private int[][] parents; // parents[i] = indices of parent tasks
-    private double refMakespan = 1.0;
-    private double refCost = 1.0;
+    protected double[] length; // task length (MI)
+    protected double[] mips; // VM speed
+    protected double[] price; // VM price \ sec
+    protected int[][] parents; // parents[i] = indices of parent tasks
+    protected double refMakespan = 1.0;
+    protected double refCost = 1.0;
 
-    // ---------- chromosome ----------
     protected static class Individual {
         public int[] vm; // task index -> VM index
         public int[] priority; // task index -> priority (lower = earlier)
@@ -74,7 +95,6 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
             priority = new int[n];
         }
 
-        /** Exact copy, including evaluation state (dirty flag is copied too). */
         public Individual cloneIndividual() {
             Individual c = new Individual(vm.length);
             System.arraycopy(vm, 0, c.vm, 0, vm.length);
@@ -160,8 +180,57 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
                 parents[i][k++] = pi;
         }
 
-        refMakespan = Math.max(1e-9, total / mips[fastest]);
-        refCost = Math.max(1e-12, price[fastest] * refMakespan);
+        double sumPrice = 0.0;
+        for (int j = 0; j < m; j++) {
+            sumPrice += price[j];
+        }
+
+        // Realistic parallel reference scale (across m VMs)
+        refMakespan = Math.max(1e-9, total / (mips[fastest] * Math.max(1.0, m / 2.0)));
+        refCost = Math.max(1e-12, sumPrice * refMakespan);
+
+        // Reset dynamic bounds
+        minMakespanObserved = Double.POSITIVE_INFINITY;
+        maxMakespanObserved = Double.NEGATIVE_INFINITY;
+        minCostObserved = Double.POSITIVE_INFINITY;
+        maxCostObserved = Double.NEGATIVE_INFINITY;
+        minUtilObserved = Double.POSITIVE_INFINITY;
+        maxUtilObserved = Double.NEGATIVE_INFINITY;
+
+        frozenMinMakespan = Double.POSITIVE_INFINITY;
+        frozenMaxMakespan = Double.NEGATIVE_INFINITY;
+        frozenMinCost = Double.POSITIVE_INFINITY;
+        frozenMaxCost = Double.NEGATIVE_INFINITY;
+        frozenMinUtil = Double.POSITIVE_INFINITY;
+        frozenMaxUtil = Double.NEGATIVE_INFINITY;
+
+        // Multi-objective weights configuration and normalization (w1 + w2 + w3 = 1.0)
+        boolean hasW = System.getProperty("w1") != null || System.getProperty("w2") != null || System.getProperty("w3") != null;
+        boolean mo = Boolean.getBoolean("mo");
+        if (hasW) {
+            w1Makespan = dbl("w1", 1.0);
+            w2Cost = dbl("w2", 0.0);
+            w3Util = dbl("w3", 0.0);
+        } else if (mo) {
+            // Multi-objective defaults (Section 4.2 / Section 5.6)
+            w1Makespan = 0.5;
+            w2Cost = 0.3;
+            w3Util = 0.2;
+        } else {
+            // Default single-objective replication mode
+            w1Makespan = 1.0;
+            w2Cost = 0.0;
+            w3Util = 0.0;
+        }
+
+        double sumW = w1Makespan + w2Cost + w3Util;
+        if (sumW > 0) {
+            w1Makespan /= sumW;
+            w2Cost /= sumW;
+            w3Util /= sumW;
+        }
+
+        normMode = System.getProperty("norm", "ref");
         buildEdgeDelays();
     }
 
@@ -203,10 +272,7 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
         return order;
     }
 
-    /**
-     * Re-decode the order from priorities and rewrite priorities as ranks
-     * (idempotent).
-     */
+    // Re-decode order from priorities and rewrite priorities as ranks (idempotent).
     protected void redecode(Individual ind) {
         ind.order = decodeOrder(ind.priority);
         for (int rank = 0; rank < ind.order.size(); rank++) {
@@ -222,7 +288,7 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
         redecode(ind);
     }
 
-    // Random VM assignment + random feasible topological order
+    // Random VM assignment + random feasible topo. order
     protected Individual randomIndividual() {
         Individual ind = new Individual(n);
         List<Integer> perm = new ArrayList<>(n);
@@ -254,9 +320,9 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
         return evalCount < EVAL_BUDGET;
     }
 
-    // Hook for communication delay (Eq. 8, e.g. inter-datacenter transfer).
-    // Default: none.
+    // Hook for communication delay (Eq. 8: inter-datacenter transfer).
     protected double commDelay(int p, int c, int vp, int vc) {
+        // Default none.
         if (!USE_COMM || dcOfVm(vp) == dcOfVm(vc))
             return 0.0;
         Double d = edgeDelay.get((long) p * n + c);
@@ -290,11 +356,112 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
         return new double[] { makespan, cost, util };
     }
 
-    /** Eq. 4 with seed-independent reference values. Lower is better. */
+    public void updateMetricBounds(double makespan, double cost, double util) {
+        if (makespan < minMakespanObserved) minMakespanObserved = makespan;
+        if (makespan > maxMakespanObserved) maxMakespanObserved = makespan;
+        if (cost < minCostObserved) minCostObserved = cost;
+        if (cost > maxCostObserved) maxCostObserved = cost;
+        if (util < minUtilObserved) minUtilObserved = util;
+        if (util > maxUtilObserved) maxUtilObserved = util;
+    }
+
+    public void refreshBounds(Individual[] pop, Individual best) {
+        if (pop == null || pop.length == 0) return;
+        double minM = Double.POSITIVE_INFINITY, maxM = Double.NEGATIVE_INFINITY;
+        double minC = Double.POSITIVE_INFINITY, maxC = Double.NEGATIVE_INFINITY;
+        double minU = Double.POSITIVE_INFINITY, maxU = Double.NEGATIVE_INFINITY;
+
+        List<Individual> all = new ArrayList<>(pop.length + (best != null ? 1 : 0));
+        for (Individual p : pop) {
+            if (p != null && p.rawMetrics != null) all.add(p);
+        }
+        if (best != null && best.rawMetrics != null) {
+            all.add(best);
+        }
+
+        for (Individual ind : all) {
+            double m = ind.rawMetrics[0];
+            double c = ind.rawMetrics[1];
+            double u = ind.rawMetrics[2];
+
+            if (m < minM) minM = m;
+            if (m > maxM) maxM = m;
+            if (c < minC) minC = c;
+            if (c > maxC) maxC = c;
+            if (u < minU) minU = u;
+            if (u > maxU) maxU = u;
+        }
+
+        if (minM < Double.POSITIVE_INFINITY) {
+            frozenMinMakespan = minM;
+            frozenMaxMakespan = maxM;
+            frozenMinCost = minC;
+            frozenMaxCost = maxC;
+            frozenMinUtil = minU;
+            frozenMaxUtil = maxU;
+
+            updateMetricBounds(minM, minC, minU);
+            updateMetricBounds(maxM, maxC, maxU);
+        }
+
+        // Re-score every individual under the refreshed bounds
+        for (Individual p : pop) {
+            if (p != null && p.rawMetrics != null) {
+                p.fitness = calcFitness(p.rawMetrics);
+            }
+        }
+        if (best != null && best.rawMetrics != null) {
+            best.fitness = calcFitness(best.rawMetrics);
+        }
+    }
+
+    public void refreshBounds(Collection<Individual> pop, Individual best) {
+        if (pop != null && !pop.isEmpty()) {
+            refreshBounds(pop.toArray(new Individual[0]), best);
+        }
+    }
+
+    public void setWeights(double w1, double w2, double w3) {
+        this.w1Makespan = w1;
+        this.w2Cost = w2;
+        this.w3Util = w3;
+        double sum = w1 + w2 + w3;
+        if (sum > 0) {
+            this.w1Makespan /= sum;
+            this.w2Cost /= sum;
+            this.w3Util /= sum;
+        }
+    }
+
     protected double calcFitness(double[] mt) {
-        return W1_MAKESPAN * (mt[0] / refMakespan)
-                + W2_COST * (mt[1] / refCost)
-                + W3_UTIL * (1.0 - mt[2]);
+        double normM;
+        double normC;
+        double normU;
+
+        if ("ref".equalsIgnoreCase(normMode)) {
+            // Eq. 4: Reference normalization
+            normM = mt[0] / refMakespan;
+            normC = mt[1] / refCost;
+            normU = 1.0 - mt[2];
+        } else {
+            // Eq. 12: Min-Max normalization using frozen population bounds
+            double curMinM = (frozenMinMakespan < Double.POSITIVE_INFINITY) ? frozenMinMakespan : minMakespanObserved;
+            double curMaxM = (frozenMaxMakespan > Double.NEGATIVE_INFINITY) ? frozenMaxMakespan : maxMakespanObserved;
+            double curMinC = (frozenMinCost < Double.POSITIVE_INFINITY) ? frozenMinCost : minCostObserved;
+            double curMaxC = (frozenMaxCost > Double.NEGATIVE_INFINITY) ? frozenMaxCost : maxCostObserved;
+            double curMinU = (frozenMinUtil < Double.POSITIVE_INFINITY) ? frozenMinUtil : minUtilObserved;
+            double curMaxU = (frozenMaxUtil > Double.NEGATIVE_INFINITY) ? frozenMaxUtil : maxUtilObserved;
+
+            double spanM = curMaxM - curMinM;
+            double spanC = curMaxC - curMinC;
+            double spanU = curMaxU - curMinU;
+
+            normM = (spanM > 1e-6) ? (mt[0] - curMinM) / spanM : (mt[0] / refMakespan);
+            normC = (spanC > 1e-6) ? (mt[1] - curMinC) / spanC : (mt[1] / refCost);
+            normU = (spanU > 1e-6) ? (curMaxU - mt[2]) / spanU : (1.0 - mt[2]);
+        }
+
+        return w1Makespan * normM + w2Cost * normC + w3Util * normU;
     }
 
     protected boolean isDirectlyRelated(Task a, Task b) {
@@ -365,7 +532,6 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
         return best;
     }
 
-    /** Schedule identity: execution order plus VM of each task. */
     protected String signature(Individual ind) {
         StringBuilder[] per = new StringBuilder[m];
         for (Task t : ind.order) {
@@ -381,10 +547,6 @@ public abstract class OrderAwarePlanningBase extends BasePlanningAlgorithm {
         return out.toString();
     }
 
-    /**
-     * Write the best schedule back to the tasks and reorder the planner's task list
-     * in place.
-     */
     @SuppressWarnings({ "rawtypes", "unchecked" })
     protected void applySolution(Individual best) {
         for (int rank = 0; rank < best.order.size(); rank++) {

@@ -138,8 +138,8 @@ public class SimSetup {
 
         Log.printLine("Number of jobs: " + list.size());
         if (plannerEstimatedMakespan != null) {
-            Log.printLine("Planner Estimated Makespan: " + plannerEstimatedMakespan);
-            Log.printLine("Simulation Actual Makespan: " + makespan);
+            Log.printLine("Planner Estimated: " + plannerEstimatedMakespan);
+            Log.printLine("Simulation Actual: " + makespan);
         }
         Log.printLine("Makespan: " + makespan);
 
